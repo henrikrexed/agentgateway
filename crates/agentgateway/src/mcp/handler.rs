@@ -24,7 +24,7 @@ use rmcp::model::{
 	ClientNotification, ClientRequest, Implementation, JsonRpcNotification, JsonRpcRequest,
 	ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, Prompt,
 	PromptsCapability, ProtocolVersion, RequestId, ResourcesCapability, ServerCapabilities,
-	ServerInfo, ServerJsonRpcMessage, ServerResult, Tool, ToolsCapability,
+ServerInfo, ServerJsonRpcMessage, ServerResult, Tool, ToolsCapability, CallToolResult, Content,
 };
 use tracing::warn;
 
@@ -355,6 +355,8 @@ impl Relay {
 			)));
 		};
 		let stream = us.generic_stream(r, &ctx).await?;
+		let compression_format = self.upstreams.get_compression_format(service_name);
+		let stream = compress_stream(stream, compression_format);
 
 		messages_to_response(id, stream)
 	}
@@ -538,6 +540,7 @@ pub fn setup_request_log(
 	(_span, log, cel)
 }
 
+fn compress_stream(	stream: impl Stream<Item = Result<ServerJsonRpcMessage, ClientError>> + Send + 'static,	compression_format: Option<CompressionFormat>,) -> impl Stream<Item = Result<ServerJsonRpcMessage, ClientError>> + Send + 'static {	use futures_util::StreamExt;	use rmcp::model::{CallToolResult, Content, ServerJsonRpcMessage, ServerResult};		stream.map(move |result| {		let Ok(mut message) = result else {			return result;		};				let Some(format) = compression_format else {			return Ok(message);		};				// Only compress CallToolResult messages		if let ServerJsonRpcMessage::Result { result, .. } = &mut message {			if let ServerResult::CallToolResult(CallToolResult { content, .. }) = result {				for content_item in content.iter_mut() {					if let Content::Text { text } = content_item {						if let Some(compressed) = compress_response(text, format) {							*text = compressed;						}					}				}			}		}				Ok(message)	})}
 fn messages_to_response(
 	id: RequestId,
 	stream: impl Stream<Item = Result<ServerJsonRpcMessage, ClientError>> + Send + 'static,

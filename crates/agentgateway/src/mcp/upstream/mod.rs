@@ -15,10 +15,15 @@ use tokio::process::Command;
 
 use crate::http::jwt::Claims;
 use crate::mcp::FailureMode;
+use crate::mcp::compress::CompressionFormat;
 use crate::mcp::mergestream::Messages;
+use crate::mcp::compress::CompressionFormat;
 use crate::mcp::router::{McpBackendGroup, McpTarget};
+use crate::mcp::compress::CompressionFormat;
 use crate::mcp::streamablehttp::StreamableHttpPostResponse;
+use crate::mcp::compress::CompressionFormat;
 use crate::mcp::{mergestream, upstream};
+use crate::mcp::compress::CompressionFormat;
 use crate::proxy::ProxyError;
 use crate::proxy::httpproxy::PolicyClient;
 use crate::types::agent::McpTargetSpec;
