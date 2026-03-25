@@ -4,9 +4,11 @@ on:
   push:
     branches:
       - "main"
+      - "feat/mcp-response-compression"
   pull_request:
     branches:
       - "main"
+      - "feat/mcp-response-compression"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}
