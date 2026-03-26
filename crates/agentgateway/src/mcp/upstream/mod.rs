@@ -303,7 +303,7 @@ impl UpstreamGroup {
 				);
 				let client = sse::Client::new(upstream_client, path.into());
 
-				upstream::Upstream::McpSSE(_client)
+				upstream::Upstream::McpSSE(client)
 			},
 			McpTargetSpec::Mcp(mcp) => {
 				debug!(
@@ -328,7 +328,7 @@ impl UpstreamGroup {
 				let client = streamablehttp::Client::new(http_client, path.into())
 					.map_err(|_| mcp::Error::InvalidSessionIdHeader)?;
 
-				upstream::Upstream::McpStreamable(_client)
+				upstream::Upstream::McpStreamable(client)
 			},
 			McpTargetSpec::Stdio { cmd, args, env } => {
 				debug!("starting stdio transport for target: {}", target.name);
