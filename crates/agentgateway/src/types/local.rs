@@ -698,7 +698,7 @@ impl LocalBackend {
 							McpTargetSpec::Sse(SseTargetSpec {
 								backend: bref,
 								path: path.clone(),
-							response_compression: None,
+								response_compression: None,
 							})
 						},
 						LocalMcpTargetSpec::Mcp { backend } => {
@@ -710,7 +710,7 @@ impl LocalBackend {
 							McpTargetSpec::Mcp(StreamableHTTPTargetSpec {
 								backend: bref,
 								path: path.clone(),
-							response_compression: None,
+								response_compression: None,
 							})
 						},
 						LocalMcpTargetSpec::Stdio { cmd, args, env } => McpTargetSpec::Stdio { cmd, args, env },
@@ -724,7 +724,7 @@ impl LocalBackend {
 							McpTargetSpec::OpenAPI(OpenAPITarget {
 								backend: bref,
 								schema: openapi_schema.into(),
-							response_compression: None,
+								response_compression: None,
 							})
 						},
 					};

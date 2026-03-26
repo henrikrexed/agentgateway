@@ -23,8 +23,8 @@ use rmcp::ErrorData;
 use rmcp::model::{
 	ClientNotification, ClientRequest, Implementation, JsonRpcNotification, JsonRpcRequest,
 	ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, Prompt,
-	PromptsCapability, ProtocolVersion, RequestId, ResourcesCapability, ServerCapabilities,
-ServerInfo, ServerJsonRpcMessage, ServerResult, Tool, ToolsCapability, RawContent,
+	PromptsCapability, ProtocolVersion, RawContent, RequestId, ResourcesCapability,
+	ServerCapabilities, ServerInfo, ServerJsonRpcMessage, ServerResult, Tool, ToolsCapability,
 };
 use tracing::warn;
 
@@ -558,12 +558,16 @@ fn compress_stream(
 		};
 
 		// Only compress CallToolResult messages
-		if let ServerJsonRpcMessage::Response(response) = &mut message && let ServerResult::CallToolResult(CallToolResult { content, .. }) = &mut response.result {
-				for content_item in content.iter_mut() {
-					if let RawContent::Text(text_content) = &mut content_item.raw && let Some(compressed) = compress_response(&text_content.text, format) {
-							text_content.text = compressed;
-					}
+		if let ServerJsonRpcMessage::Response(response) = &mut message
+			&& let ServerResult::CallToolResult(CallToolResult { content, .. }) = &mut response.result
+		{
+			for content_item in content.iter_mut() {
+				if let RawContent::Text(text_content) = &mut content_item.raw
+					&& let Some(compressed) = compress_response(&text_content.text, format)
+				{
+					text_content.text = compressed;
 				}
+			}
 		}
 
 		Ok(message)

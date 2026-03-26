@@ -895,7 +895,7 @@ impl TryFrom<&proto::agent::McpTarget> for McpTarget {
 						} else {
 							s.path.clone()
 						},
-					response_compression: None,
+						response_compression: None,
 					})
 				},
 			},
