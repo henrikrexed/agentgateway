@@ -558,16 +558,12 @@ fn compress_stream(
 		};
 
 		// Only compress CallToolResult messages
-		if let ServerJsonRpcMessage::Response(response) = &mut message {
-			if let ServerResult::CallToolResult(CallToolResult { content, .. }) = &mut response.result {
+		if let ServerJsonRpcMessage::Response(response) = &mut message && let ServerResult::CallToolResult(CallToolResult { content, .. }) = &mut response.result {
 				for content_item in content.iter_mut() {
-					if let RawContent::Text(text_content) = &mut content_item.raw {
-						if let Some(compressed) = compress_response(&text_content.text, format) {
+					if let RawContent::Text(text_content) = &mut content_item.raw && let Some(compressed) = compress_response(&text_content.text, format) {
 							text_content.text = compressed;
-						}
 					}
 				}
-			}
 		}
 
 		Ok(message)

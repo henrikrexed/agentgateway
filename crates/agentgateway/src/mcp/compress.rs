@@ -34,8 +34,7 @@ pub fn compress_response(content: &str, format: CompressionFormat) -> Option<Str
 		Value::Object(ref obj) => {
 			// Look for a top-level key whose value is an array of objects
 			for (key, value) in obj.iter() {
-				if let Value::Array(arr) = value {
-					if arr.iter().all(|v| v.is_object()) && !arr.is_empty() {
+				if let Value::Array(arr) = value && arr.iter().all(|v| v.is_object()) && !arr.is_empty() {
 						let mut result = String::new();
 						
 						// Add scalar fields as header lines
@@ -48,9 +47,8 @@ pub fn compress_response(content: &str, format: CompressionFormat) -> Option<Str
 							result.push('\n');
 						}
 						
-						result.push_str(&convert_array_to_table(&arr, format));
+						result.push_str(&convert_array_to_table(arr, format));
 						return Some(result);
-					}
 				}
 			}
 			None
@@ -98,7 +96,7 @@ fn convert_array_to_table(arr: &[Value], format: CompressionFormat) -> String {
 			result.push_str(" |\n");
 			
 			// Separator row
-			result.push_str("|");
+			result.push('|');
 			for _ in &all_keys {
 				result.push_str("------|");
 			}
