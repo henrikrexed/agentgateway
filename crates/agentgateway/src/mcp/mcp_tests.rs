@@ -1331,6 +1331,7 @@ fn fake_streamable_target(name: &str, addr: SocketAddr) -> Arc<McpTarget> {
 				"/unused-{name}"
 			)),
 			path: "/mcp".to_string(),
+			response_compression: None,
 		}),
 		backend_policies: Default::default(),
 		backend: Some(crate::types::agent::SimpleBackend::Opaque(
