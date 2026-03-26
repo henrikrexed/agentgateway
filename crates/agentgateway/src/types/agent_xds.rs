@@ -885,6 +885,7 @@ impl TryFrom<&proto::agent::McpTarget> for McpTarget {
 					} else {
 						s.path.clone()
 					},
+					response_compression: None,
 				}),
 				Protocol::Undefined | Protocol::StreamableHttp => {
 					McpTargetSpec::Mcp(StreamableHTTPTargetSpec {
@@ -894,6 +895,7 @@ impl TryFrom<&proto::agent::McpTarget> for McpTarget {
 						} else {
 							s.path.clone()
 						},
+					response_compression: None,
 					})
 				},
 			},

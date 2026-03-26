@@ -1,12 +1,11 @@
-#[cfg(feature = schema)]
-use crate::JsonSchema;
+#[cfg(feature = "schema")]
+use schemars::JsonSchema;
 
-use serde_json::{Value, Map};
-use std::collections::HashMap;
+use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[cfg_attr(feature = schema, derive(JsonSchema))]
-#[serde(rename_all = camelCase)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase")]
 pub enum CompressionFormat {
 	Markdown,
 	Tsv,
@@ -24,9 +23,9 @@ pub fn compress_response(content: &str, format: CompressionFormat) -> Option<Str
 	
 	match json {
 		// Direct array of objects
-		Value::Array(ref arr) => {
+		Value::Array(arr) => {
 			if arr.iter().all(|v| v.is_object()) && !arr.is_empty() {
-				Some(convert_array_to_table(arr, format))
+				Some(convert_array_to_table(&arr, format))
 			} else {
 				None
 			}
@@ -35,7 +34,7 @@ pub fn compress_response(content: &str, format: CompressionFormat) -> Option<Str
 		Value::Object(ref obj) => {
 			// Look for a top-level key whose value is an array of objects
 			for (key, value) in obj.iter() {
-				if let Value::Array(ref arr) = value {
+				if let Value::Array(arr) = value {
 					if arr.iter().all(|v| v.is_object()) && !arr.is_empty() {
 						let mut result = String::new();
 						
@@ -49,7 +48,7 @@ pub fn compress_response(content: &str, format: CompressionFormat) -> Option<Str
 							result.push('\n');
 						}
 						
-						result.push_str(&convert_array_to_table(arr, format));
+						result.push_str(&convert_array_to_table(&arr, format));
 						return Some(result);
 					}
 				}
