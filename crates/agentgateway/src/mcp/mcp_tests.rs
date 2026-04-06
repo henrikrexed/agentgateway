@@ -1230,6 +1230,7 @@ async fn test_zero_targets_fail_closed() {
 	};
 	let client = PolicyClient {
 		inputs: setup_proxy_test("{}").unwrap().pi,
+		span_writer: Default::default(),
 	};
 	let err = crate::mcp::upstream::UpstreamGroup::new(client, backend).unwrap_err();
 	assert!(matches!(err, crate::mcp::Error::NoBackends));
@@ -1244,6 +1245,7 @@ async fn test_zero_targets_fail_open() {
 	};
 	let client = PolicyClient {
 		inputs: setup_proxy_test("{}").unwrap().pi,
+		span_writer: Default::default(),
 	};
 	crate::mcp::upstream::UpstreamGroup::new(client, backend).unwrap();
 }
@@ -1281,6 +1283,7 @@ async fn test_setup_partial_success_fail_open() {
 	};
 	let client = PolicyClient {
 		inputs: setup_proxy_test("{}").unwrap().pi,
+		span_writer: Default::default(),
 	};
 	let group = crate::mcp::upstream::UpstreamGroup::new(client, backend).unwrap();
 	assert_eq!(group.size(), 1);
@@ -1318,6 +1321,7 @@ async fn test_all_targets_fail_open_still_errors() {
 	};
 	let client = PolicyClient {
 		inputs: setup_proxy_test("{}").unwrap().pi,
+		span_writer: Default::default(),
 	};
 	let err = crate::mcp::upstream::UpstreamGroup::new(client, backend).unwrap_err();
 	assert!(matches!(err, crate::mcp::Error::NoBackends));
@@ -1374,6 +1378,7 @@ async fn test_fanout_deletion_fail_open_skips_failed_upstreams() {
 		empty_mcp_policies(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
+			span_writer: Default::default(),
 		},
 	)
 	.unwrap();
@@ -1407,6 +1412,7 @@ fn test_set_sessions_matches_by_target_name() {
 		empty_mcp_policies(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
+			span_writer: Default::default(),
 		},
 	)
 	.unwrap();
@@ -1456,6 +1462,7 @@ fn test_set_sessions_rejects_mismatched_target_set() {
 		empty_mcp_policies(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
+			span_writer: Default::default(),
 		},
 	)
 	.unwrap();
