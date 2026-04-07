@@ -506,8 +506,8 @@ impl Relay {
 			}
 		};
 		let instructions = Some(
-            "This server is a gateway to a set of mcp servers. It is responsible for routing requests to the correct server and aggregating the results.".to_string(),
-        );
+			"This server is a gateway to a set of mcp servers. It is responsible for routing requests to the correct server and aggregating the results.".to_string(),
+		);
 		ServerInfo {
 			protocol_version: pv,
 			capabilities,
@@ -573,6 +573,7 @@ fn compress_stream(
 		Ok(message)
 	})
 }
+
 fn messages_to_response(
 	id: RequestId,
 	stream: impl Stream<Item = Result<ServerJsonRpcMessage, ClientError>> + Send + 'static,
