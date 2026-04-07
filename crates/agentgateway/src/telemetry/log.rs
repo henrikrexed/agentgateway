@@ -1252,7 +1252,10 @@ impl PolicyGrpcLogExporter {
 		let channel = GrpcReferenceChannel {
 			target,
 			policies: Arc::new(policies),
-			client: crate::proxy::httpproxy::PolicyClient { inputs, span_writer: Default::default() },
+			client: crate::proxy::httpproxy::PolicyClient {
+				inputs,
+				span_writer: Default::default(),
+			},
 		};
 		let tonic_client =
 			opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient::new(
