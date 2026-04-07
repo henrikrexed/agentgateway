@@ -788,7 +788,9 @@ impl Policy {
 		phase: crate::telemetry::metrics::GuardrailPhase,
 		action: crate::telemetry::metrics::GuardrailAction,
 	) {
-		let _span = client.span_writer.start(format!("guardrail:{phase:?}:{action:?}"));
+		let _span = client
+			.span_writer
+			.start(format!("guardrail:{phase:?}:{action:?}"));
 		client
 			.inputs
 			.metrics
