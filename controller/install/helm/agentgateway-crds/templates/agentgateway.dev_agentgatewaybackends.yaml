@@ -6639,6 +6639,26 @@ spec:
                           minLength: 1
                           pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                           type: string
+                        protocol:
+                          description: Protocol is the protocol to use for the connection
+                            to the MCPBackend target.
+                          enum:
+                          - StreamableHTTP
+                          - SSE
+                          type: string
+                        responseCompression:
+                          description: ResponseCompression configures response compression
+                            for the target.
+                          properties:
+                            enabled:
+                              description: Enabled determines if response compression
+                                is enabled.
+                              type: boolean
+                            format:
+                              description: Format specifies the format to use for
+                                compression (e.g., markdown).
+                              type: string
+                          type: object
                         selector:
                           description: |-
                             selector is a label selector is the selector to use to select Services.
