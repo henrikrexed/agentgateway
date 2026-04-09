@@ -378,17 +378,16 @@ impl UpstreamGroup {
 	}
 
 	pub fn get_compression_format(&self, service_name: &str) -> Option<CompressionFormat> {
-		// Look for the named service and return its compression format
-		if let Some(upstream) = self.by_name.get(service_name) {
-			match &**upstream {
-				Upstream::McpStreamable(_client) => {
-					// Get compression format from the client config if available
-					Some(CompressionFormat::None) // Default for now
-				},
-				_ => Some(CompressionFormat::None),
+		for tgt in &self.backend.targets {
+			if tgt.name.as_str() == service_name {
+				return match &tgt.spec {
+					McpTargetSpec::Sse(s) => s.response_compression,
+					McpTargetSpec::Mcp(s) => s.response_compression,
+					McpTargetSpec::OpenAPI(s) => s.response_compression,
+					McpTargetSpec::Stdio { .. } => None,
+				};
 			}
-		} else {
-			Some(CompressionFormat::None)
 		}
+		None
 	}
 }

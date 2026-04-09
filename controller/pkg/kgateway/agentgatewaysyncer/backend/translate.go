@@ -256,6 +256,13 @@ func translateMCPBackends(ctx plugins.PolicyCtx, be *agentgateway.AgentgatewayBa
 				mcpTarget.Protocol = api.MCPTarget_STREAMABLE_HTTP
 			}
 
+			if rc := target.ResponseCompression; rc != nil && rc.Enabled {
+				mcpTarget.ResponseCompression = &api.MCPTarget_ResponseCompression{
+					Enabled: rc.Enabled,
+					Format:  rc.Format,
+				}
+			}
+
 			mcpTargets = append(mcpTargets, mcpTarget)
 		} else if s := target.Selector; s != nil {
 			// Krt only allows 1 filter per type, so we build a composite filter here
@@ -343,6 +350,13 @@ func translateMCPBackends(ctx plugins.PolicyCtx, be *agentgateway.AgentgatewayBa
 						},
 						Protocol: toMCPProtocol(appProtocol),
 						Path:     service.Annotations[apiannotations.MCPServiceHTTPPath],
+					}
+
+					if rc := target.ResponseCompression; rc != nil && rc.Enabled {
+						mcpTarget.ResponseCompression = &api.MCPTarget_ResponseCompression{
+							Enabled: rc.Enabled,
+							Format:  rc.Format,
+						}
 					}
 
 					mcpTargets = append(mcpTargets, mcpTarget)
