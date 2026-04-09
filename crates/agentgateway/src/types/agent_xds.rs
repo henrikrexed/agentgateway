@@ -886,7 +886,7 @@ impl TryFrom<&proto::agent::McpTarget> for McpTarget {
 					_ => crate::mcp::compress::CompressionFormat::None,
 				});
 
-			Ok(Self {
+		Ok(Self {
 			name: strng::new(&s.name),
 			spec: match proto {
 				Protocol::Sse => McpTargetSpec::Sse(SseTargetSpec {

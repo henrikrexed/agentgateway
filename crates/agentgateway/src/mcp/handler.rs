@@ -29,6 +29,7 @@ use rmcp::model::{
 use tracing::warn;
 
 use crate::mcp::compress::{CompressionFormat, compress_response};
+
 const DELIMITER: &str = "_";
 
 fn resource_name(default_target_name: Option<&String>, target: &str, name: &str) -> String {
