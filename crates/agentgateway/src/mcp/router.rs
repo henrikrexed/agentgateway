@@ -145,6 +145,7 @@ impl App {
 					backend: backends.clone(),
 					policies: authorization_policies.clone(),
 					client: client.clone(),
+					metrics: pi.metrics.clone(),
 				},
 			))
 			.await
@@ -161,6 +162,7 @@ impl App {
 					backend: backends.clone(),
 					policies: authorization_policies.clone(),
 					client: client.clone(),
+					metrics: pi.metrics.clone(),
 				},
 			))
 			.await

@@ -3,7 +3,7 @@ use schemars::JsonSchema;
 
 use serde_json::Value;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub enum CompressionFormat {
@@ -11,6 +11,17 @@ pub enum CompressionFormat {
 	Tsv,
 	Csv,
 	None,
+}
+
+impl std::fmt::Display for CompressionFormat {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			CompressionFormat::Markdown => write!(f, "markdown"),
+			CompressionFormat::Tsv => write!(f, "tsv"),
+			CompressionFormat::Csv => write!(f, "csv"),
+			CompressionFormat::None => write!(f, "none"),
+		}
+	}
 }
 
 /// Entry point for response compression

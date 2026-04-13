@@ -1366,6 +1366,7 @@ fn persisted_session(
 async fn test_fanout_deletion_fail_open_skips_failed_upstreams() {
 	let good = mock_streamable_http_server(true).await;
 	let bad_addr = SocketAddr::from(([127, 0, 0, 1], 31999));
+	let test_pi = setup_proxy_test("{}").unwrap().pi;
 	let relay = Relay::new(
 		McpBackendGroup {
 			targets: vec![
@@ -1377,9 +1378,10 @@ async fn test_fanout_deletion_fail_open_skips_failed_upstreams() {
 		},
 		empty_mcp_policies(),
 		PolicyClient {
-			inputs: setup_proxy_test("{}").unwrap().pi,
+			inputs: test_pi.clone(),
 			span_writer: Default::default(),
 		},
+		test_pi.metrics.clone(),
 	)
 	.unwrap();
 
@@ -1400,6 +1402,7 @@ async fn test_fanout_deletion_fail_open_skips_failed_upstreams() {
 
 #[test]
 fn test_set_sessions_matches_by_target_name() {
+	let test_pi = setup_proxy_test("{}").unwrap().pi;
 	let relay = Relay::new(
 		McpBackendGroup {
 			targets: vec![
@@ -1411,9 +1414,10 @@ fn test_set_sessions_matches_by_target_name() {
 		},
 		empty_mcp_policies(),
 		PolicyClient {
-			inputs: setup_proxy_test("{}").unwrap().pi,
+			inputs: test_pi.clone(),
 			span_writer: Default::default(),
 		},
+		test_pi.metrics.clone(),
 	)
 	.unwrap();
 
@@ -1450,6 +1454,7 @@ fn test_set_sessions_matches_by_target_name() {
 
 #[test]
 fn test_set_sessions_rejects_mismatched_target_set() {
+	let test_pi = setup_proxy_test("{}").unwrap().pi;
 	let relay = Relay::new(
 		McpBackendGroup {
 			targets: vec![
@@ -1461,9 +1466,10 @@ fn test_set_sessions_rejects_mismatched_target_set() {
 		},
 		empty_mcp_policies(),
 		PolicyClient {
-			inputs: setup_proxy_test("{}").unwrap().pi,
+			inputs: test_pi.clone(),
 			span_writer: Default::default(),
 		},
+		test_pi.metrics.clone(),
 	)
 	.unwrap();
 

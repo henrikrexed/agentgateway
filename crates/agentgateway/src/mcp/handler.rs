@@ -44,17 +44,19 @@ fn resource_name(default_target_name: Option<&String>, target: &str, name: &str)
 pub struct Relay {
 	upstreams: Arc<upstream::UpstreamGroup>,
 	pub policies: McpAuthorizationSet,
+	pub metrics: Arc<crate::telemetry::metrics::Metrics>,
 }
 
 pub struct RelayInputs {
 	pub backend: McpBackendGroup,
 	pub policies: McpAuthorizationSet,
 	pub client: PolicyClient,
+	pub metrics: Arc<crate::telemetry::metrics::Metrics>,
 }
 
 impl RelayInputs {
 	pub fn build_new_connections(self) -> Result<Relay, mcp::Error> {
-		Relay::new(self.backend, self.policies, self.client)
+		Relay::new(self.backend, self.policies, self.client, self.metrics)
 	}
 }
 
@@ -63,16 +65,19 @@ impl Relay {
 		backend: McpBackendGroup,
 		policies: McpAuthorizationSet,
 		client: PolicyClient,
+		metrics: Arc<crate::telemetry::metrics::Metrics>,
 	) -> Result<Self, mcp::Error> {
 		Ok(Self {
 			upstreams: Arc::new(upstream::UpstreamGroup::new(client, backend)?),
 			policies,
+			metrics,
 		})
 	}
 	pub fn with_policies(&self, policies: McpAuthorizationSet) -> Self {
 		Self {
 			upstreams: self.upstreams.clone(),
 			policies,
+			metrics: self.metrics.clone(),
 		}
 	}
 
@@ -358,7 +363,12 @@ impl Relay {
 		};
 		let stream = us.generic_stream(r, &ctx).await?;
 		let compression_format = self.upstreams.get_compression_format(service_name);
-		let stream = compress_stream(stream, compression_format);
+		let stream = compress_stream(
+			stream,
+			compression_format,
+			self.metrics.clone(),
+			service_name.to_string(),
+		);
 
 		messages_to_response(id, stream)
 	}
@@ -545,7 +555,10 @@ pub fn setup_request_log(
 fn compress_stream(
 	stream: impl Stream<Item = Result<ServerJsonRpcMessage, ClientError>> + Send + 'static,
 	compression_format: Option<CompressionFormat>,
+	metrics: Arc<crate::telemetry::metrics::Metrics>,
+	target_name: String,
 ) -> impl Stream<Item = Result<ServerJsonRpcMessage, ClientError>> + Send + 'static {
+	use agent_core::metrics::DefaultedUnknown;
 	use futures_util::StreamExt;
 	use rmcp::model::{CallToolResult, ServerJsonRpcMessage, ServerResult};
 
@@ -562,11 +575,49 @@ fn compress_stream(
 		if let ServerJsonRpcMessage::Response(response) = &mut message
 			&& let ServerResult::CallToolResult(CallToolResult { content, .. }) = &mut response.result
 		{
+			let labels = crate::telemetry::metrics::CompressionLabels {
+				gateway: DefaultedUnknown::default(),
+				listener: DefaultedUnknown::default(),
+				route: DefaultedUnknown::default(),
+				target: DefaultedUnknown::from(Some(agent_core::strng::new(&target_name))),
+				format: DefaultedUnknown::from(Some(format)),
+			};
+
 			for content_item in content.iter_mut() {
-				if let RawContent::Text(text_content) = &mut content_item.raw
-					&& let Some(compressed) = compress_response(&text_content.text, format)
-				{
-					text_content.text = compressed;
+				if let RawContent::Text(text_content) = &mut content_item.raw {
+					let original_len = text_content.text.len() as f64;
+					if let Some(compressed) = compress_response(&text_content.text, format) {
+						let compressed_len = compressed.len() as f64;
+						let ratio = if original_len > 0. {
+							compressed_len / original_len
+						} else {
+							1.0
+						};
+
+						metrics
+							.mcp_response_compression_original_bytes
+							.get_or_create(&labels)
+							.observe(original_len);
+						metrics
+							.mcp_response_compression_compressed_bytes
+							.get_or_create(&labels)
+							.observe(compressed_len);
+						metrics
+							.mcp_response_compression_ratio
+							.get_or_create(&labels)
+							.observe(ratio);
+						metrics
+							.mcp_response_compression_total
+							.get_or_create(&labels)
+							.inc();
+
+						text_content.text = compressed;
+					} else {
+						metrics
+							.mcp_response_compression_skipped_total
+							.get_or_create(&labels)
+							.inc();
+					}
 				}
 			}
 		}
