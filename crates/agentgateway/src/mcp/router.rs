@@ -104,7 +104,10 @@ impl App {
 			}
 		};
 		let sm = self.session.clone();
-		let client = PolicyClient { inputs: pi.clone() };
+		let client = PolicyClient {
+			inputs: pi.clone(),
+			span_writer: log.span_writer(),
+		};
 		let authorization_policies = backend_policies
 			.mcp_authorization
 			.unwrap_or_else(|| McpAuthorizationSet::new(RuleSets::from(Vec::new())));
@@ -142,6 +145,7 @@ impl App {
 					backend: backends.clone(),
 					policies: authorization_policies.clone(),
 					client: client.clone(),
+					metrics: pi.metrics.clone(),
 				},
 			))
 			.await
@@ -158,6 +162,7 @@ impl App {
 					backend: backends.clone(),
 					policies: authorization_policies.clone(),
 					client: client.clone(),
+					metrics: pi.metrics.clone(),
 				},
 			))
 			.await

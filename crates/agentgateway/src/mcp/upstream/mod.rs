@@ -15,6 +15,7 @@ use tokio::process::Command;
 
 use crate::http::jwt::Claims;
 use crate::mcp::FailureMode;
+use crate::mcp::compress::CompressionFormat;
 use crate::mcp::mergestream::Messages;
 use crate::mcp::router::{McpBackendGroup, McpTarget};
 use crate::mcp::streamablehttp::StreamableHttpPostResponse;
@@ -386,5 +387,19 @@ impl UpstreamGroup {
 		};
 
 		Ok(target)
+	}
+
+	pub fn get_compression_format(&self, service_name: &str) -> Option<CompressionFormat> {
+		for tgt in &self.backend.targets {
+			if tgt.name.as_str() == service_name {
+				return match &tgt.spec {
+					McpTargetSpec::Sse(s) => s.response_compression,
+					McpTargetSpec::Mcp(s) => s.response_compression,
+					McpTargetSpec::OpenAPI(s) => s.response_compression,
+					McpTargetSpec::Stdio { .. } => None,
+				};
+			}
+		}
+		None
 	}
 }
