@@ -3,7 +3,7 @@ use std::fmt::Debug;
 use agent_core::metrics::{CustomField, DefaultedUnknown, EncodeArc, EncodeDebug, EncodeDisplay};
 use agent_core::strng::RichStrng;
 use agent_core::version;
-use frozen_collections::{FzHashSet, SetQuery};
+use frozen_collections::FzHashSet;
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter;
 use prometheus_client::metrics::family::Family;
@@ -158,6 +158,9 @@ pub struct Metrics {
 
 	// metrics for guardrail checks (allow/mask/reject) for request/response
 	pub guardrail_checks: Family<GuardrailLabels, counter::Counter>,
+
+	// metrics for request retries
+	pub retries: Counter,
 
 	// MCP response compression metrics
 	pub mcp_response_compression_original_bytes:
@@ -383,6 +386,7 @@ impl Metrics {
 				);
 				m
 			},
+<<<<<<< HEAD
 			mcp_response_compression_original_bytes: {
 				let m = Family::<CompressionLabels, _>::new_with_constructor(move || {
 					PromHistogram::new(COMPRESSION_BYTES_BUCKET)
@@ -436,6 +440,11 @@ impl Metrics {
 				);
 				m
 			},
+			retries: build(
+				&mut registry,
+				"retries",
+				"The total number of request retries",
+			),
 		}
 	}
 }

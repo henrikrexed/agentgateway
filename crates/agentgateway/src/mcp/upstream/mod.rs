@@ -22,6 +22,7 @@ use crate::mcp::streamablehttp::StreamableHttpPostResponse;
 use crate::mcp::{mergestream, upstream};
 use crate::proxy::ProxyError;
 use crate::proxy::httpproxy::PolicyClient;
+use crate::transport::BufferLimit;
 use crate::types::agent::McpTargetSpec;
 use crate::*;
 
@@ -29,6 +30,7 @@ use crate::*;
 pub struct IncomingRequestContext {
 	headers: http::HeaderMap,
 	claims: Option<Claims>,
+	buffer_limit: Option<BufferLimit>,
 }
 
 impl IncomingRequestContext {
@@ -37,13 +39,16 @@ impl IncomingRequestContext {
 		Self {
 			headers: http::HeaderMap::new(),
 			claims: None,
+			buffer_limit: None,
 		}
 	}
 	pub fn new(parts: &::http::request::Parts) -> Self {
 		let claims = parts.extensions.get::<Claims>().cloned();
+		let buffer_limit = parts.extensions.get::<BufferLimit>().cloned();
 		Self {
 			headers: parts.headers.clone(),
 			claims,
+			buffer_limit,
 		}
 	}
 	pub fn apply(&self, req: &mut http::Request) {
@@ -58,6 +63,9 @@ impl IncomingRequestContext {
 		}
 		if let Some(claims) = self.claims.as_ref() {
 			req.extensions_mut().insert(claims.clone());
+		}
+		if let Some(buffer_limit) = self.buffer_limit.as_ref() {
+			req.extensions_mut().insert(buffer_limit.clone());
 		}
 	}
 }
@@ -85,6 +93,8 @@ pub enum UpstreamError {
 	Proxy(#[from] ProxyError),
 	#[error("stdio upstream error: {0}")]
 	Stdio(#[from] io::Error),
+	#[error("stdio server exited")]
+	StdioShutdown,
 	#[error("upstream closed on send")]
 	Send,
 	#[error("upstream closed on receive")]
@@ -104,6 +114,8 @@ impl Upstream {
 	pub fn get_session_state(&self) -> Option<http::sessionpersistence::MCPSession> {
 		match self {
 			Upstream::McpStreamable(c) => Some(c.get_session_state()),
+			Upstream::McpSSE(c) => Some(c.get_session_state()),
+			Upstream::OpenAPI(c) => Some(c.get_session_state()),
 			_ => None,
 		}
 	}
@@ -111,9 +123,9 @@ impl Upstream {
 	pub fn set_session_id(&self, id: Option<&str>, pinned: Option<SocketAddr>) {
 		match self {
 			Upstream::McpStreamable(c) => c.set_session_id(id, pinned),
-			Upstream::McpSSE(_) => {},
+			Upstream::McpSSE(c) => c.set_session_id(id, pinned),
 			Upstream::McpStdio(_) => {},
-			Upstream::OpenAPI(_) => {},
+			Upstream::OpenAPI(c) => c.set_session_id(id, pinned),
 		}
 	}
 

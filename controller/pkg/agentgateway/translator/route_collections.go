@@ -14,6 +14,7 @@ import (
 	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/util/protomarshal"
 	"istio.io/istio/pkg/util/sets"
+	"istio.io/istio/pkg/workloadapi"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -27,11 +28,11 @@ import (
 	agwir "github.com/agentgateway/agentgateway/controller/pkg/agentgateway/ir"
 	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/plugins"
 	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/utils"
-	"github.com/agentgateway/agentgateway/controller/pkg/kgateway/agentgatewaysyncer/status"
-	"github.com/agentgateway/agentgateway/controller/pkg/kgateway/wellknown"
 	"github.com/agentgateway/agentgateway/controller/pkg/pluginsdk/krtutil"
 	"github.com/agentgateway/agentgateway/controller/pkg/pluginsdk/reporter"
 	"github.com/agentgateway/agentgateway/controller/pkg/reports"
+	"github.com/agentgateway/agentgateway/controller/pkg/syncer/status"
+	"github.com/agentgateway/agentgateway/controller/pkg/wellknown"
 )
 
 // AgwRouteCollection creates the collection of translated Routes
@@ -114,10 +115,10 @@ func AgwRouteCollection(
 	routes := krt.JoinCollection([]krt.Collection[agwir.AgwResource]{httpRoutes, grpcRoutes, tcpRoutes, tlsRoutes}, krtopts.ToOptions("ADPRoutes")...)
 
 	routeAttachments := krt.JoinCollection([]krt.Collection[*plugins.RouteAttachment]{
-		gatewayRouteAttachmentCountCollection(inputs, httpRouteCol, wellknown.HTTPRouteGVK, krtopts),
-		gatewayRouteAttachmentCountCollection(inputs, grpcRouteCol, wellknown.GRPCRouteGVK, krtopts),
-		gatewayRouteAttachmentCountCollection(inputs, tlsRouteCol, wellknown.TLSRouteGVK, krtopts),
-		gatewayRouteAttachmentCountCollection(inputs, tcpRouteCol, wellknown.TCPRouteGVK, krtopts),
+		gatewayRouteAttachmentCollection(inputs, httpRouteCol, wellknown.HTTPRouteGVK, krtopts),
+		gatewayRouteAttachmentCollection(inputs, grpcRouteCol, wellknown.GRPCRouteGVK, krtopts),
+		gatewayRouteAttachmentCollection(inputs, tlsRouteCol, wellknown.TLSRouteGVK, krtopts),
+		gatewayRouteAttachmentCollection(inputs, tcpRouteCol, wellknown.TCPRouteGVK, krtopts),
 	})
 
 	ancestorBackends := krt.JoinCollection([]krt.Collection[*utils.AncestorBackend]{
@@ -260,7 +261,7 @@ func ProcessParentReferences[T any](
 					msg = "Parent listener not usable or not permitted"
 				} else if parent.OriginalReference.SectionName != nil || parent.OriginalReference.Port != nil {
 					// Use string literal to avoid compile issues if the constant name differs.
-					reason = gwv1.RouteConditionReason("NoMatchingParent")
+					reason = "NoMatchingParent"
 					msg = "No listener with the specified sectionName on the parent Gateway"
 				}
 				pr.SetCondition(reporter.RouteCondition{
@@ -293,27 +294,53 @@ func ProcessParentReferences[T any](
 }
 
 func resourceMapper(t any, parent RouteParentReference) *api.Resource {
+	var serviceKey *workloadapi.NamespacedHostname
+	if parent.ServiceKey != nil {
+		serviceKey = &workloadapi.NamespacedHostname{
+			Namespace: parent.ServiceKey.Namespace,
+			Hostname:  parent.ServiceKey.Name,
+		}
+	}
+
 	switch tt := t.(type) {
 	case AgwTCPRoute:
 		// safety: a shallow clone is ok because we only modify a top level field (Key)
 		inner := protomarshal.ShallowClone(tt.TCPRoute)
 		inner.ListenerKey = parent.ListenerKey
-		if sec := string(parent.ParentSection); sec != "" {
-			inner.Key += "." + sec
+		inner.ServiceKey = serviceKey
+		inner.Key += routeKeySuffix(parent)
+		if inner.ServiceKey != nil {
+			// if linked by Service, no need for hostname matching
+			inner.Hostnames = nil
 		}
+
 		return ToAgwResource(AgwTCPRoute{TCPRoute: inner})
 	case AgwRoute:
 		// safety: a shallow clone is ok because we only modify a top level field (Key)
 		inner := protomarshal.ShallowClone(tt.Route)
 		inner.ListenerKey = parent.ListenerKey
-		if sec := string(parent.ParentSection); sec != "" {
-			inner.Key += "." + sec
+		inner.ServiceKey = serviceKey
+		inner.Key += routeKeySuffix(parent)
+		if inner.ServiceKey != nil {
+			// if linked by Service, no need for hostname matching
+			inner.Hostnames = nil
 		}
+
 		return ToAgwResource(AgwRoute{Route: inner})
 	default:
 		log.Fatalf("unknown route kind %T", t)
 		return nil
 	}
+}
+
+func routeKeySuffix(parent RouteParentReference) string {
+	if parent.ServiceKey != nil {
+		return ".svc." + parent.ServiceKey.Namespace + "." + parent.ServiceKey.Name
+	}
+	if sec := string(parent.ParentSection); sec != "" {
+		return "." + sec
+	}
+	return ""
 }
 
 // reasonResolvedRefs picks a ResolvedRefs reason from a conversion failure condition.
@@ -325,7 +352,7 @@ func reasonResolvedRefs(cond *reporter.RouteCondition, ok bool) gwv1.RouteCondit
 	if cond != nil && cond.Reason != "" {
 		return cond.Reason
 	}
-	return gwv1.RouteConditionReason("Invalid")
+	return "Invalid"
 }
 
 // buildAttachedRoutesMapAllowed is the same as buildAttachedRoutesMap,
@@ -493,7 +520,7 @@ type RouteContext struct {
 // RouteContextInputs defines the collections needed to translate a route.
 type RouteContextInputs struct {
 	Grants         ReferenceGrants
-	RouteParents   RouteParents
+	RouteParents   ParentResolver
 	Services       krt.Collection[*corev1.Service]
 	InferencePools krt.Collection[*inf.InferencePool]
 	Namespaces     krt.Collection[*corev1.Namespace]
@@ -528,9 +555,9 @@ func buildGatewayRoutes[T any](convertRules func() T) T {
 	return convertRules()
 }
 
-// gatewayRouteAttachmentCountCollection holds the generic logic to determine the parents a route is attached to, used for
-// computing the aggregated `attachedRoutes` status in Gateway.
-func gatewayRouteAttachmentCountCollection[T controllers.Object](
+// gatewayRouteAttachmentCollection holds the generic logic to determine the parents a route is attached to.
+// Used for computing `attachedRoutes` status and for resolving route-to-gateway associations in the ReferenceIndex.
+func gatewayRouteAttachmentCollection[T controllers.Object](
 	inputs RouteContextInputs,
 	col krt.Collection[T],
 	kind schema.GroupVersionKind,
@@ -545,12 +572,23 @@ func gatewayRouteAttachmentCountCollection[T controllers.Object](
 
 		parentRefs := extractParentReferenceInfo(ctx, inputs.RouteParents, obj)
 		return slices.MapFilter(FilteredReferences(parentRefs), func(e RouteParentReference) **plugins.RouteAttachment {
-			if e.ParentKey.Kind != wellknown.GatewayGVK.Kind && e.ParentKey.Kind != wellknown.ListenerSetGVK.Kind {
+			if e.ParentKey.Kind == wellknown.ListenerSetGVK.Kind {
+				return ptr.Of(&plugins.RouteAttachment{
+					From:         from,
+					To:           e.ParentKey,
+					Gateway:      e.ParentGateway,
+					ListenerName: string(e.ParentSection),
+				})
+			}
+			if e.ParentGateway.Name == "" {
 				return nil
 			}
 			return ptr.Of(&plugins.RouteAttachment{
-				From:         from,
-				To:           e.ParentKey,
+				From: from,
+				To: utils.TypedNamespacedName{
+					Kind:           wellknown.GatewayGVK.Kind,
+					NamespacedName: e.ParentGateway,
+				},
 				Gateway:      e.ParentGateway,
 				ListenerName: string(e.ParentSection),
 			})

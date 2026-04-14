@@ -26,7 +26,7 @@ use crate::types::loadbalancer::{ActiveHandle, EndpointWithInfo};
 use crate::*;
 
 pub mod anthropic;
-pub mod azureopenai;
+pub mod azure;
 pub mod bedrock;
 pub mod gemini;
 pub mod openai;
@@ -36,10 +36,20 @@ mod conversion;
 pub mod policy;
 mod types;
 
+use crate::store;
 pub use types::SimpleChatCompletionMessage;
 
 #[cfg(test)]
 mod tests;
+
+fn normalize_sse_response_headers(mut resp: Response) -> Response {
+	resp.headers_mut().insert(
+		header::CONTENT_TYPE,
+		HeaderValue::from_static("text/event-stream"),
+	);
+	resp.headers_mut().remove(header::CONTENT_LENGTH);
+	resp
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -79,6 +89,7 @@ pub struct NamedAIProvider {
 	pub provider: AIProvider,
 	pub host_override: Option<Target>,
 	pub path_override: Option<Strng>,
+	pub path_prefix: Option<Strng>,
 	/// Whether to tokenize on the request flow. This enables us to do more accurate rate limits,
 	/// since we know (part of) the cost of the request upfront.
 	/// This comes with the cost of an expensive operation.
@@ -86,12 +97,6 @@ pub struct NamedAIProvider {
 	pub tokenize: bool,
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub inline_policies: Vec<BackendPolicy>,
-}
-
-impl NamedAIProvider {
-	pub fn use_default_policies(&self) -> bool {
-		self.host_override.is_none()
-	}
 }
 
 #[apply(schema!)]
@@ -125,7 +130,7 @@ pub enum AIProvider {
 	Vertex(vertex::Provider),
 	Anthropic(anthropic::Provider),
 	Bedrock(bedrock::Provider),
-	AzureOpenAI(azureopenai::Provider),
+	Azure(azure::Provider),
 }
 
 #[apply(schema!)]
@@ -135,7 +140,7 @@ pub enum LocalModelAIProvider {
 	Vertex,
 	Anthropic,
 	Bedrock,
-	AzureOpenAI,
+	Azure,
 }
 
 trait Provider {
@@ -230,12 +235,24 @@ impl LLMInfo {
 pub struct LLMResponse {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub input_tokens: Option<u64>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub input_image_tokens: Option<u64>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub input_text_tokens: Option<u64>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub input_audio_tokens: Option<u64>,
 	/// count_tokens contains the number of tokens in the request, when using the token counting endpoint
 	/// These are not counted as 'input tokens' since they do not consume input tokens.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub count_tokens: Option<u64>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub output_tokens: Option<u64>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub output_image_tokens: Option<u64>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub output_text_tokens: Option<u64>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub output_audio_tokens: Option<u64>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub total_tokens: Option<u64>,
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -244,7 +261,8 @@ pub struct LLMResponse {
 	pub cache_creation_input_tokens: Option<u64>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub cached_input_tokens: Option<u64>,
-
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub service_tier: Option<Strng>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub provider_model: Option<Strng>,
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -270,7 +288,7 @@ impl AIProvider {
 			AIProvider::Gemini(_p) => gemini::Provider::NAME,
 			AIProvider::Vertex(_p) => vertex::Provider::NAME,
 			AIProvider::Bedrock(_p) => bedrock::Provider::NAME,
-			AIProvider::AzureOpenAI(_p) => azureopenai::Provider::NAME,
+			AIProvider::Azure(_p) => azure::Provider::NAME,
 		}
 	}
 	pub fn override_model(&self) -> Option<Strng> {
@@ -280,7 +298,7 @@ impl AIProvider {
 			AIProvider::Gemini(p) => p.model.clone(),
 			AIProvider::Vertex(p) => p.model.clone(),
 			AIProvider::Bedrock(p) => p.model.clone(),
-			AIProvider::AzureOpenAI(p) => p.model.clone(),
+			AIProvider::Azure(p) => p.model.clone(),
 		}
 	}
 	pub fn default_connector(&self) -> (Target, BackendPolicies) {
@@ -309,7 +327,7 @@ impl AIProvider {
 				};
 				(Target::Hostname(p.get_host(), 443), bp)
 			},
-			AIProvider::AzureOpenAI(p) => {
+			AIProvider::Azure(p) => {
 				let bp = BackendPolicies {
 					backend_tls: Some(http::backendtls::SYSTEM_TRUST.clone()),
 					backend_auth: Some(BackendAuth::Azure(AzureAuth::Implicit {
@@ -327,16 +345,26 @@ impl AIProvider {
 		req: &mut Request,
 		route_type: RouteType,
 		llm_request: Option<&LLMRequest>,
-		apply_host_path_defaults: bool,
+		path_override: Option<&str>,
+		path_prefix: Option<&str>,
+		has_host_override: bool,
 	) -> anyhow::Result<()> {
-		if apply_host_path_defaults {
-			self.set_host_path_defaults(req, route_type, llm_request)?;
+		if let Some(path_override) = path_override {
+			http::modify_req_uri(req, |uri| {
+				uri.path_and_query = Some(PathAndQuery::from_str(path_override)?);
+				Ok(())
+			})?;
+		} else {
+			self.set_default_path(req, route_type, llm_request, path_prefix, has_host_override)?;
+		}
+		if !has_host_override {
+			self.set_default_authority(req, llm_request)?;
 		}
 		self.set_required_fields(req)?;
 		Ok(())
 	}
 
-	fn set_path_and_query(uri: &mut http::uri::Parts, path: &'static str) -> anyhow::Result<()> {
+	fn set_path_and_query(uri: &mut http::uri::Parts, path: &str) -> anyhow::Result<()> {
 		let query = uri.path_and_query.as_ref().and_then(|p| p.query());
 		if let Some(query) = query {
 			uri.path_and_query = Some(PathAndQuery::from_maybe_shared(format!(
@@ -344,45 +372,60 @@ impl AIProvider {
 				path, query
 			))?);
 		} else {
-			uri.path_and_query = Some(PathAndQuery::from_static(path));
+			uri.path_and_query = Some(PathAndQuery::try_from(path)?);
 		};
 		Ok(())
 	}
 
-	pub fn set_host_path_defaults(
+	pub fn set_default_path(
 		&self,
 		req: &mut Request,
 		route_type: RouteType,
 		llm_request: Option<&LLMRequest>,
+		path_prefix: Option<&str>,
+		has_host_override: bool,
 	) -> anyhow::Result<()> {
-		let override_path = !matches!(route_type, RouteType::Passthrough | RouteType::Detect);
+		if matches!(route_type, RouteType::Passthrough | RouteType::Detect) {
+			return Ok(());
+		}
+
+		let supports_path_prefix = matches!(self, AIProvider::OpenAI(_) | AIProvider::Anthropic(_));
+		if has_host_override && !(supports_path_prefix && path_prefix.is_some()) {
+			return Ok(());
+		}
+
 		match self {
 			AIProvider::OpenAI(_) => http::modify_req(req, |req| {
 				http::modify_uri(req, |uri| {
-					if override_path {
-						Self::set_path_and_query(uri, openai::path(route_type))?;
-					}
-					uri.authority = Some(Authority::from_static(openai::DEFAULT_HOST_STR));
+					let path = format!(
+						"{}{}",
+						path_prefix.map_or(openai::DEFAULT_BASE_PATH, |prefix| {
+							prefix.trim_end_matches('/')
+						}),
+						openai::path_suffix(route_type)
+					);
+					Self::set_path_and_query(uri, &path)?;
 					Ok(())
 				})?;
 				Ok(())
 			}),
 			AIProvider::Anthropic(_) => http::modify_req(req, |req| {
 				http::modify_uri(req, |uri| {
-					if override_path {
-						Self::set_path_and_query(uri, anthropic::path(route_type))?;
-					}
-					uri.authority = Some(Authority::from_static(anthropic::DEFAULT_HOST_STR));
+					let path = format!(
+						"{}{}",
+						path_prefix.map_or(anthropic::DEFAULT_BASE_PATH, |prefix| {
+							prefix.trim_end_matches('/')
+						}),
+						anthropic::path_suffix(route_type),
+					);
+					Self::set_path_and_query(uri, &path)?;
 					Ok(())
 				})?;
 				Ok(())
 			}),
 			AIProvider::Gemini(_) => http::modify_req(req, |req| {
 				http::modify_uri(req, |uri| {
-					if override_path {
-						Self::set_path_and_query(uri, gemini::path(route_type))?;
-					}
-					uri.authority = Some(Authority::from_static(gemini::DEFAULT_HOST_STR));
+					Self::set_path_and_query(uri, gemini::path(route_type))?;
 					Ok(())
 				})?;
 				Ok(())
@@ -392,46 +435,72 @@ impl AIProvider {
 				let streaming = llm_request.map(|l| l.streaming).unwrap_or(false);
 				http::modify_req(req, |req| {
 					http::modify_uri(req, |uri| {
-						if override_path {
-							let path = provider.get_path_for_model(route_type, request_model, streaming);
-							uri.path_and_query = Some(PathAndQuery::from_str(&path)?);
-						}
-						uri.authority = Some(Authority::from_str(&provider.get_host(request_model))?);
+						let path = provider.get_path_for_model(route_type, request_model, streaming);
+						uri.path_and_query = Some(PathAndQuery::from_str(&path)?);
 						Ok(())
 					})?;
 					Ok(())
 				})
 			},
-			AIProvider::Bedrock(provider) => {
-				http::modify_req(req, |req| {
-					http::modify_uri(req, |uri| {
-						if override_path && let Some(l) = llm_request {
-							let path =
-								provider.get_path_for_route(route_type, l.streaming, l.request_model.as_str());
-							uri.path_and_query = Some(PathAndQuery::from_str(&path)?);
-						}
-						uri.authority = Some(Authority::from_str(&provider.get_host())?);
-						Ok(())
-					})?;
-					// Store the region in request extensions so AWS signing can use it
-					req.extensions.insert(bedrock::AwsRegion {
-						region: provider.region.as_str().to_string(),
-					});
-					Ok(())
-				})
-			},
-			AIProvider::AzureOpenAI(provider) => http::modify_req(req, |req| {
+			AIProvider::Bedrock(provider) => http::modify_req(req, |req| {
 				http::modify_uri(req, |uri| {
-					if override_path && let Some(l) = llm_request {
+					if let Some(l) = llm_request {
+						let path =
+							provider.get_path_for_route(route_type, l.streaming, l.request_model.as_str());
+						uri.path_and_query = Some(PathAndQuery::from_str(&path)?);
+					}
+					Ok(())
+				})?;
+				Ok(())
+			}),
+			AIProvider::Azure(provider) => http::modify_req(req, |req| {
+				http::modify_uri(req, |uri| {
+					if let Some(l) = llm_request {
 						let path = provider.get_path_for_model(route_type, l.request_model.as_str());
 						uri.path_and_query = Some(PathAndQuery::from_str(&path)?);
 					}
-					uri.authority = Some(Authority::from_str(&provider.get_host())?);
 					Ok(())
 				})?;
 				Ok(())
 			}),
 		}
+	}
+
+	pub fn set_default_authority(
+		&self,
+		req: &mut Request,
+		llm_request: Option<&LLMRequest>,
+	) -> anyhow::Result<()> {
+		let authority = match self {
+			AIProvider::OpenAI(_) => Authority::from_static(openai::DEFAULT_HOST_STR),
+			AIProvider::Anthropic(_) => Authority::from_static(anthropic::DEFAULT_HOST_STR),
+			AIProvider::Gemini(_) => Authority::from_static(gemini::DEFAULT_HOST_STR),
+			AIProvider::Vertex(provider) => {
+				let request_model = llm_request.map(|l| l.request_model.as_str());
+				Authority::from_str(&provider.get_host(request_model))?
+			},
+			AIProvider::Azure(provider) => Authority::from_str(&provider.get_host())?,
+			AIProvider::Bedrock(provider) => {
+				// Store the region in request extensions so AWS signing can use it.
+				return http::modify_req(req, |req| {
+					http::modify_uri(req, |uri| {
+						uri.authority = Some(Authority::from_str(&provider.get_host())?);
+						Ok(())
+					})?;
+					req.extensions.insert(bedrock::AwsRegion {
+						region: provider.region.as_str().to_string(),
+					});
+					Ok(())
+				});
+			},
+		};
+		http::modify_req(req, |req| {
+			http::modify_uri(req, |uri| {
+				uri.authority = Some(authority);
+				Ok(())
+			})?;
+			Ok(())
+		})
 	}
 
 	pub fn set_required_fields(&self, req: &mut Request) -> anyhow::Result<()> {
@@ -693,7 +762,7 @@ impl AIProvider {
 				// All providers support completions input
 			},
 			(
-				AIProvider::OpenAI(_) | AIProvider::AzureOpenAI(_) | AIProvider::Bedrock(_),
+				AIProvider::OpenAI(_) | AIProvider::Azure(_) | AIProvider::Bedrock(_),
 				InputFormat::Responses,
 			) => {
 				// OpenAI supports responses input (Bedrock supports responses input via translation)
@@ -704,11 +773,11 @@ impl AIProvider {
 				| AIProvider::Vertex(_)
 				| AIProvider::OpenAI(_)
 				| AIProvider::Gemini(_)
-				| AIProvider::AzureOpenAI(_),
+				| AIProvider::Azure(_),
 				InputFormat::Messages,
 			) => {
 				// Anthropic supports messages input (Bedrock & Vertex support assuming serving Anthropic models)
-				// OpenAI/Gemini/AzureOpenAI support messages via translation to chat completions
+				// OpenAI/Gemini/Azure support messages via translation to chat completions
 			},
 			(
 				AIProvider::Anthropic(_) | AIProvider::Bedrock(_) | AIProvider::Vertex(_),
@@ -719,7 +788,7 @@ impl AIProvider {
 			(
 				AIProvider::OpenAI(_)
 				| AIProvider::Gemini(_)
-				| AIProvider::AzureOpenAI(_)
+				| AIProvider::Azure(_)
 				| AIProvider::Bedrock(_)
 				| AIProvider::Vertex(_),
 				InputFormat::Embeddings,
@@ -790,9 +859,7 @@ impl AIProvider {
 					let body = req.to_anthropic()?;
 					provider.prepare_anthropic_message_body(body)?
 				},
-				AIProvider::OpenAI(_) | AIProvider::Gemini(_) | AIProvider::AzureOpenAI(_) => {
-					req.to_openai()?
-				},
+				AIProvider::OpenAI(_) | AIProvider::Gemini(_) | AIProvider::Azure(_) => req.to_openai()?,
 				AIProvider::Vertex(p) => req.to_vertex(p)?,
 				AIProvider::Anthropic(_) => req.to_anthropic()?,
 				AIProvider::Bedrock(p) => req.to_bedrock(
@@ -817,7 +884,10 @@ impl AIProvider {
 		include_completion_in_log: bool,
 		resp: Response,
 	) -> Result<Response, AIError> {
-		if req.streaming {
+		// Non-success responses are plain JSON, not event-stream data.
+		// Only enter the streaming path for successful responses; errors
+		// fall through to the buffered path where process_error translates them.
+		if req.streaming && resp.status().is_success() {
 			return self
 				.process_streaming(req, rate_limit, log, include_completion_in_log, resp)
 				.await;
@@ -972,7 +1042,7 @@ impl AIProvider {
 			)),
 			// Completions with OpenAI: just passthrough
 			(
-				AIProvider::OpenAI(_) | AIProvider::Gemini(_) | AIProvider::AzureOpenAI(_),
+				AIProvider::OpenAI(_) | AIProvider::Gemini(_) | AIProvider::Azure(_),
 				InputFormat::Completions,
 			) => Ok(Box::new(
 				serde_json::from_slice::<types::completions::Response>(bytes).map_err(|e| {
@@ -984,8 +1054,8 @@ impl AIProvider {
 					AIError::ResponseParsing(e)
 				})?,
 			)),
-			// Responses with OpenAI/AzureOpenAI: just passthrough
-			(AIProvider::OpenAI(_) | AIProvider::AzureOpenAI(_), InputFormat::Responses) => Ok(Box::new(
+			// Responses with OpenAI/Azure: just passthrough
+			(AIProvider::OpenAI(_) | AIProvider::Azure(_), InputFormat::Responses) => Ok(Box::new(
 				serde_json::from_slice::<types::responses::Response>(bytes).map_err(|e| {
 					warn!(
 						error = %e,
@@ -1011,9 +1081,9 @@ impl AIProvider {
 				serde_json::from_slice::<types::messages::Response>(bytes)
 					.map_err(AIError::ResponseParsing)?,
 			)),
-			// OpenAI/Gemini/AzureOpenAI messages: translate from chat completions
+			// OpenAI/Gemini/Azure messages: translate from chat completions
 			(
-				AIProvider::OpenAI(_) | AIProvider::Gemini(_) | AIProvider::AzureOpenAI(_),
+				AIProvider::OpenAI(_) | AIProvider::Gemini(_) | AIProvider::Azure(_),
 				InputFormat::Messages,
 			) => conversion::completions::from_messages::translate_response(bytes),
 			// Supported paths with conversion...
@@ -1089,11 +1159,16 @@ impl AIProvider {
 			parts.headers.remove(header::TRANSFER_ENCODING);
 		}
 		let resp = Response::from_parts(parts, body);
+		let resp = if matches!(input_format, InputFormat::Detect) {
+			resp
+		} else {
+			normalize_sse_response_headers(resp)
+		};
 
 		Ok(match (self, input_format) {
 			// Completions with OpenAI: just passthrough
 			(
-				AIProvider::OpenAI(_) | AIProvider::Gemini(_) | AIProvider::AzureOpenAI(_),
+				AIProvider::OpenAI(_) | AIProvider::Gemini(_) | AIProvider::Azure(_),
 				InputFormat::Completions,
 			) => conversion::completions::passthrough_stream(
 				AmendOnDrop::new(log, rate_limit),
@@ -1122,7 +1197,7 @@ impl AIProvider {
 			(
 				AIProvider::OpenAI(_)
 				| AIProvider::Gemini(_)
-				| AIProvider::AzureOpenAI(_)
+				| AIProvider::Azure(_)
 				| AIProvider::Vertex(_),
 				InputFormat::Responses,
 			) => resp.map(|b| {
@@ -1143,9 +1218,9 @@ impl AIProvider {
 			(AIProvider::Anthropic(_), InputFormat::Messages) => resp.map(|b| {
 				conversion::messages::passthrough_stream(b, buffer, AmendOnDrop::new(log, rate_limit))
 			}),
-			// OpenAI/Gemini/AzureOpenAI messages: translate from chat completions
+			// OpenAI/Gemini/Azure messages: translate from chat completions
 			(
-				AIProvider::OpenAI(_) | AIProvider::Gemini(_) | AIProvider::AzureOpenAI(_),
+				AIProvider::OpenAI(_) | AIProvider::Gemini(_) | AIProvider::Azure(_),
 				InputFormat::Messages,
 			) => resp.map(|b| {
 				conversion::completions::from_messages::translate_stream(
@@ -1250,7 +1325,7 @@ impl AIProvider {
 	) -> Result<Bytes, AIError> {
 		match (self, req.input_format) {
 			(
-				AIProvider::OpenAI(_) | AIProvider::AzureOpenAI(_),
+				AIProvider::OpenAI(_) | AIProvider::Azure(_),
 				InputFormat::Completions | InputFormat::Responses | InputFormat::Embeddings,
 			) => {
 				// Passthrough; nothing needed
@@ -1274,7 +1349,7 @@ impl AIProvider {
 				// Passthrough; Vertex embeddings endpoint already returns OpenAI-compatible errors.
 				Ok(bytes.clone())
 			},
-			(AIProvider::OpenAI(_) | AIProvider::AzureOpenAI(_), InputFormat::Messages) => {
+			(AIProvider::OpenAI(_) | AIProvider::Azure(_), InputFormat::Messages) => {
 				conversion::completions::from_messages::translate_error(bytes, status)
 			},
 			(AIProvider::Gemini(_), InputFormat::Messages) => {

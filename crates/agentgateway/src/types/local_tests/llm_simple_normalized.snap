@@ -42,6 +42,9 @@ binds:
                     "*": passthrough
                     /v1/chat/completions: completions
                     /v1/embeddings: embeddings
+                    /v1/images/edits: detect
+                    /v1/images/generations: detect
+                    /v1/images/variations: detect
                     /v1/messages: messages
                     /v1/responses: responses
                     /v1/responses/compact: detect
@@ -70,6 +73,9 @@ binds:
                     "*": passthrough
                     /v1/chat/completions: completions
                     /v1/embeddings: embeddings
+                    /v1/images/edits: detect
+                    /v1/images/generations: detect
+                    /v1/images/variations: detect
                     /v1/messages: messages
                     /v1/responses: responses
                     /v1/responses/compact: detect
@@ -95,6 +101,9 @@ binds:
                     "*": passthrough
                     /v1/chat/completions: completions
                     /v1/embeddings: embeddings
+                    /v1/images/edits: detect
+                    /v1/images/generations: detect
+                    /v1/images/variations: detect
                     /v1/messages: messages
                     /v1/responses: responses
                     /v1/responses/compact: detect
@@ -120,6 +129,9 @@ binds:
                     "*": passthrough
                     /v1/chat/completions: completions
                     /v1/embeddings: embeddings
+                    /v1/images/edits: detect
+                    /v1/images/generations: detect
+                    /v1/images/variations: detect
                     /v1/messages: messages
                     /v1/responses: responses
                     /v1/responses/compact: detect
@@ -165,7 +177,6 @@ policies:
           rules:
             allow:
               - "jwt.email.endsWith(\"@example.com\")"
-            deny: []
         phase: route
   - key: "llm:transformation"
     name:
@@ -216,6 +227,7 @@ backends:
                         model: claude-haiku-4-5-20251001
                     hostOverride: "anthropic.internal:8443"
                     pathOverride: /v1/messages
+                    pathPrefix: ~
                     tokenize: true
                     inlinePolicies:
                       - backendAuth:
@@ -259,6 +271,7 @@ backends:
                         projectId: my-vertex-project
                     hostOverride: ~
                     pathOverride: ~
+                    pathPrefix: ~
                     tokenize: false
                     inlinePolicies:
                       - backendAuth:
@@ -288,12 +301,14 @@ backends:
                   endpoint:
                     name: gpt-7-max
                     provider:
-                      azureOpenAI:
+                      azure:
                         model: gpt-3.5-turbo
-                        host: my-azure-openai-endpoint.openai.azure.com
+                        resourceName: my-azure-openai-endpoint
+                        resourceType: openAI
                         apiVersion: v1
                     hostOverride: ~
                     pathOverride: ~
+                    pathPrefix: ~
                     tokenize: false
                   info:
                     health: 1
@@ -323,6 +338,7 @@ backends:
                       openAI: {}
                     hostOverride: ~
                     pathOverride: ~
+                    pathPrefix: ~
                     tokenize: false
                   info:
                     health: 1

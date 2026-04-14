@@ -22,12 +22,12 @@ import (
 	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/ir"
 	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/plugins"
 	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/utils"
-	"github.com/agentgateway/agentgateway/controller/pkg/kgateway/wellknown"
 	"github.com/agentgateway/agentgateway/controller/pkg/logging"
 	"github.com/agentgateway/agentgateway/controller/pkg/pluginsdk/krtutil"
 	"github.com/agentgateway/agentgateway/controller/pkg/pluginsdk/reporter"
 	"github.com/agentgateway/agentgateway/controller/pkg/reports"
 	"github.com/agentgateway/agentgateway/controller/pkg/utils/kubeutils"
+	"github.com/agentgateway/agentgateway/controller/pkg/wellknown"
 )
 
 var (
@@ -193,22 +193,6 @@ func (g GatewayListener) Equals(other GatewayListener) bool {
 		g.ParentGateway == other.ParentGateway &&
 		g.ParentObject == other.ParentObject &&
 		g.ParentInfo.Equals(other.ParentInfo)
-}
-
-func (g ParentInfo) Equals(other ParentInfo) bool {
-	return g.ParentGateway == other.ParentGateway &&
-		g.ParentGatewayClassName == other.ParentGatewayClassName &&
-		g.ListenerKey == other.ListenerKey &&
-		g.OriginalHostname == other.OriginalHostname &&
-		g.SectionName == other.SectionName &&
-		g.Port == other.Port &&
-		g.Protocol == other.Protocol &&
-		g.TLSPassthrough == other.TLSPassthrough &&
-		g.CreationTimestamp == other.CreationTimestamp &&
-		slices.EqualFunc(g.AllowedKinds, other.AllowedKinds, func(a, b gwv1.RouteGroupKind) bool {
-			return a.Kind == b.Kind && ptr.Equal(a.Group, b.Group)
-		}) &&
-		slices.Equal(g.Hostnames, other.Hostnames)
 }
 
 type GatewayCollectionConfig struct {
@@ -549,6 +533,8 @@ func reportNotAllowedListenerSet(status *gwv1.ListenerSetStatus, obj *gwv1.Liste
 	status.Conditions = SetConditions(obj.Generation, status.Conditions, gatewayConditions)
 }
 
+type ParentResolver = plugins.ParentResolver
+
 // RouteParents holds information about things Routes can reference as parents.
 type RouteParents struct {
 	Gateways     krt.Collection[*GatewayListener]
@@ -556,10 +542,25 @@ type RouteParents struct {
 }
 
 // Fetch returns the parents for a given parent key.
-func (p RouteParents) Fetch(ctx krt.HandlerContext, pk utils.TypedNamespacedName) []*ParentInfo {
+func (p RouteParents) ParentsFor(ctx krt.HandlerContext, pk utils.TypedNamespacedName) []*ParentInfo {
 	return slices.Map(krt.Fetch(ctx, p.Gateways, krt.FilterIndex(p.GatewayIndex, pk)), func(gw *GatewayListener) *ParentInfo {
 		return &gw.ParentInfo
 	})
+}
+
+// CompositeParentResolver combines multiple ParentResolvers, concatenating
+// results from each. This allows plugins to contribute additional parent
+// resolution logic alongside the default Gateway-based resolution.
+type CompositeParentResolver struct {
+	Resolvers []ParentResolver
+}
+
+func (c *CompositeParentResolver) ParentsFor(ctx krt.HandlerContext, pk utils.TypedNamespacedName) []*ParentInfo {
+	var result []*ParentInfo
+	for _, r := range c.Resolvers {
+		result = append(result, r.ParentsFor(ctx, pk)...)
+	}
+	return result
 }
 
 // BuildRouteParents builds a RouteParents from a collection of gateways.

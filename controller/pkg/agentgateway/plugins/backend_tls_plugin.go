@@ -20,8 +20,8 @@ import (
 
 	"github.com/agentgateway/agentgateway/api"
 	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/utils"
-	"github.com/agentgateway/agentgateway/controller/pkg/kgateway/translator/sslutils"
-	"github.com/agentgateway/agentgateway/controller/pkg/kgateway/wellknown"
+	"github.com/agentgateway/agentgateway/controller/pkg/pluginsdk/krtutil"
+	"github.com/agentgateway/agentgateway/controller/pkg/wellknown"
 )
 
 // NewBackendTLSPlugin creates a new BackendTLSPolicy plugin
@@ -130,16 +130,14 @@ func translatePoliciesForBackendTLS(
 			}
 		}
 
-		backendTLSPoliciesForThisTarget := krt.FetchOne(krtctx, targetIndex, krt.FilterKey(tgtRef.String()))
-		if backendTLSPoliciesForThisTarget != nil {
-			if err := checkConflicted(btls, target, backendTLSPoliciesForThisTarget); err != nil {
-				conds[string(gwv1.PolicyConditionAccepted)].error = &ConfigError{
-					Reason:  string(gwv1.PolicyReasonConflicted),
-					Message: err.Error(),
-				}
-				// We cannot send this policy to agentgateway, as it would not know the priority logic.
-				continue
+		backendTLSPoliciesForThisTarget := krtutil.FetchIndexObjects(krtctx, targetIndex, tgtRef)
+		if err := checkConflicted(btls, target, backendTLSPoliciesForThisTarget); err != nil {
+			conds[string(gwv1.PolicyConditionAccepted)].error = &ConfigError{
+				Reason:  string(gwv1.PolicyReasonConflicted),
+				Message: err.Error(),
 			}
+			// We cannot send this policy to agentgateway, as it would not know the priority logic.
+			continue
 		}
 
 		switch string(target.Kind) {
@@ -211,7 +209,7 @@ func translatePoliciesForBackendTLS(
 				if scrt == nil {
 					logger.Warn("ignoring Gateway.spec.tls.backend; secret not found")
 				} else {
-					if _, err := sslutils.ValidateTlsSecretData(nn.Name, nn.Namespace, scrt.Data); err != nil {
+					if _, err := ValidateTlsSecretData(nn.Name, nn.Namespace, scrt.Data); err != nil {
 						logger.Warn("ignoring Gateway.spec.tls.backend; secret not found")
 					} else {
 						res.Cert = scrt.Data[corev1.TLSCertKey]
@@ -254,9 +252,9 @@ func translatePoliciesForBackendTLS(
 func checkConflicted(
 	btls *gwv1.BackendTLSPolicy,
 	target gwv1.LocalPolicyTargetReferenceWithSectionName,
-	allMatches *krt.IndexObject[utils.TypedNamespacedName, *gwv1.BackendTLSPolicy],
+	allMatches []*gwv1.BackendTLSPolicy,
 ) error {
-	for _, m := range allMatches.Objects {
+	for _, m := range allMatches {
 		if m.UID == btls.UID {
 			// This is ourself, skip it
 			continue
@@ -353,7 +351,7 @@ func getBackendTLSCACert(
 			}
 			return nil, fmt.Errorf("certificate reference not found: %v", ref)
 		}
-		caCert, err := sslutils.GetCACertFromConfigMap(ptr.Flatten(cfgmap))
+		caCert, err := GetCACertFromConfigMap(ptr.Flatten(cfgmap))
 		if err != nil {
 			conds[string(gwv1.BackendTLSPolicyReasonResolvedRefs)].error = &ConfigError{
 				Reason:  string(gwv1.BackendTLSPolicyReasonInvalidCACertificateRef),

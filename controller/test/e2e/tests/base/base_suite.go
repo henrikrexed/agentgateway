@@ -14,21 +14,21 @@ import (
 
 	"github.com/Masterminds/semver/v3"
 	"github.com/stretchr/testify/suite"
+	"istio.io/istio/pkg/config/crd"
 	"istio.io/istio/pkg/maps"
 	"istio.io/istio/pkg/test/util/assert"
 	"istio.io/istio/pkg/test/util/yml"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	apiserverschema "k8s.io/apiextensions-apiserver/pkg/apiserver/schema"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer/yaml"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 
+	apitests "github.com/agentgateway/agentgateway/controller/api/tests"
 	"github.com/agentgateway/agentgateway/controller/test/e2e"
 	"github.com/agentgateway/agentgateway/controller/test/e2e/defaults"
 	"github.com/agentgateway/agentgateway/controller/test/testutils"
@@ -76,34 +76,13 @@ var (
 		GwApiChannelStandard:     &GwApiV1_4_0,
 	}
 
-	GwApiRequireListenerSets = map[GwApiChannel]*GwApiVersion{
-		GwApiChannelExperimental: &GwApiV1_3_0,
-	}
-
-	GwApiRequireCorsFilters = map[GwApiChannel]*GwApiVersion{
-		GwApiChannelExperimental: &GwApiV1_3_0,
-	}
-
-	GwApiRequireTlsRoutes = map[GwApiChannel]*GwApiVersion{
-		GwApiChannelExperimental: &GwApiV0_3_0,
-	}
-
 	GwApiRequireTcpRoutes = map[GwApiChannel]*GwApiVersion{
 		GwApiChannelExperimental: &GwApiV0_3_0,
-	}
-
-	GwApiRequireSessionPersistence = map[GwApiChannel]*GwApiVersion{
-		GwApiChannelExperimental: &GwApiV1_1_0,
-	}
-
-	// Gateway.spec.tls.frontend was added in 1.4.0 experimental
-	GwApiRequireFrontendTLSConfig = map[GwApiChannel]*GwApiVersion{
-		GwApiChannelExperimental: &GwApiV1_4_0,
 	}
 )
 
 // selfManagedGatewayAnnotation is the annotation used to mark a Gateway as self-managed in e2e tests
-const selfManagedGatewayAnnotation = "e2e.kgateway.dev/self-managed"
+const selfManagedGatewayAnnotation = "e2e.agentgateway.dev/self-managed"
 
 // TestCase defines the manifests and resources used by a test or test suite.
 type TestCase struct {
@@ -152,7 +131,7 @@ type BaseTestingSuite struct {
 	CrdPath string
 
 	// used internally to parse the manifest files
-	gvkToStructuralSchema map[schema.GroupVersionKind]*apiserverschema.Structural
+	validator *crd.Validator
 
 	// gwApiVersion stores the detected Gateway API version (detected once and cached)
 	gwApiVersion *semver.Version
@@ -202,11 +181,6 @@ func WithMinGwApiVersion(minVersions map[GwApiChannel]*GwApiVersion) SuiteOption
 }
 
 // WithSetupByVersion sets version-specific setup configurations for the suite
-func WithSetupByVersion(setupByVersion map[GwApiChannel]map[GwApiVersion]*TestCase) SuiteOption {
-	return func(s *BaseTestingSuite) {
-		s.setupByVersion = setupByVersion
-	}
-}
 
 func WithCrdPath(crdPath string) SuiteOption {
 	return func(s *BaseTestingSuite) {
@@ -497,9 +471,7 @@ func (s *BaseTestingSuite) setupHelpers() {
 	if s.CrdPath == "" {
 		s.CrdPath = testutils.AgwCRDPath
 	}
-	var err error
-	s.gvkToStructuralSchema, err = testutils.GetStructuralSchemasForBothCharts()
-	s.Require().NoError(err)
+	s.validator = apitests.NewAgentgatewayValidatorSkipMissing(s.T())
 }
 
 // loadManifestResources populates the `manifestResources` for the given test case, by parsing each
@@ -512,14 +484,14 @@ func (s *BaseTestingSuite) loadManifestResources(testCase *TestCase) {
 
 	var resources []client.Object
 	for _, manifest := range testCase.Manifests {
-		objs, err := testutils.LoadFromFiles(manifest, s.TestInstallation.ClusterContext.Client.Scheme(), s.gvkToStructuralSchema)
+		objs, err := testutils.LoadFromFiles(manifest, s.TestInstallation.ClusterContext.Client.Scheme(), s.validator)
 		s.Require().NoError(err)
 		resources = append(resources, objs...)
 	}
 	for manifest, transform := range testCase.ManifestsWithTransform {
 		// we don't need to transform the resource since the transformation applies to the spec and not object metadata,
 		// which ensures that parsed Go objects in manifestResources can be used normally
-		objs, err := testutils.LoadFromFileWithTransform(manifest, s.TestInstallation.ClusterContext.Client.Scheme(), s.gvkToStructuralSchema, transform)
+		objs, err := testutils.LoadFromFileWithTransform(manifest, s.TestInstallation.ClusterContext.Client.Scheme(), s.validator, transform)
 		s.Require().NoError(err)
 		resources = append(resources, objs...)
 	}

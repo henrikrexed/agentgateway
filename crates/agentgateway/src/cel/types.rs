@@ -10,7 +10,7 @@ use crate::http::ext_proc::ExtProcDynamicMetadata;
 use crate::http::transformation_cel::TransformationMetadata;
 use crate::http::{apikey, basicauth, jwt};
 use crate::llm::{LLMInfo, LLMRequest};
-use crate::mcp::{ResourceId, ResourceType};
+use crate::mcp::{MCPInfo, MCPTool};
 use crate::serdes::schema;
 use crate::transport::tls::TlsInfo;
 use crate::{apply, llm};
@@ -57,7 +57,7 @@ pub struct Executor<'a> {
 	#[dynamic(rename = "llmRequest")]
 	pub llm_request: Option<&'a serde_json::Value>,
 
-	pub mcp: Option<&'a ResourceType>,
+	pub mcp: Option<&'a MCPInfo>,
 
 	pub backend: ExtensionOrDirect<'a, BackendContext>,
 
@@ -267,7 +267,7 @@ impl<'a> Executor<'a> {
 	pub fn new_empty() -> Self {
 		Default::default()
 	}
-	pub fn new_mcp(req: Option<&'a RequestSnapshot>, mcp: &'a ResourceType) -> Self {
+	pub fn new_mcp(req: Option<&'a RequestSnapshot>, mcp: &'a MCPInfo) -> Self {
 		let mut this = Self::new_empty();
 		if let Some(req) = req {
 			this.set_request_snapshot(req);
@@ -275,7 +275,7 @@ impl<'a> Executor<'a> {
 		this.mcp = Some(mcp);
 		this
 	}
-	pub fn new_mcp_request<B>(req: &'a ::http::Request<B>, mcp: &'a ResourceType) -> Self {
+	pub fn new_mcp_request<B>(req: &'a ::http::Request<B>, mcp: &'a MCPInfo) -> Self {
 		let mut this = Self::new_empty();
 		this.set_request(req);
 		this.mcp = Some(mcp);
@@ -293,7 +293,7 @@ impl<'a> Executor<'a> {
 		req: Option<&'a RequestSnapshot>,
 		resp: Option<&'a ResponseSnapshot>,
 		llm: Option<&'a LLMContext>,
-		mcp: Option<&'a ResourceType>,
+		mcp: Option<&'a MCPInfo>,
 		end_time: Option<&'a RequestTime>,
 	) -> Self {
 		let mut this = Self::new_empty();
@@ -312,14 +312,19 @@ impl<'a> Executor<'a> {
 	}
 	pub fn new_tcp_logger(
 		source_context: Option<&'a SourceContext>,
-		end_time: Option<&'a RequestTime>,
+		end_time: &'a RequestTime,
 	) -> Self {
 		let mut this = Self::new_empty();
 		// For TCP connections, set the source context directly
 		this.source = ExtensionOrDirect::Direct(source_context);
 		if let Some(f) = this.request.as_mut() {
-			f.end_time = end_time;
+			f.end_time = Some(end_time);
 		}
+		this
+	}
+	pub fn new_source(source_context: &'a SourceContext) -> Self {
+		let mut this = Self::new_empty();
+		this.source = ExtensionOrDirect::Direct(Some(source_context));
 		this
 	}
 	pub fn new_request(req: &'a crate::http::Request) -> Self {
@@ -370,7 +375,17 @@ impl<'a> Executor<'a> {
 	pub fn eval_bool(&self, expr: &Expression) -> bool {
 		self
 			.eval(expr)
-			.map(|v| v.as_bool().unwrap_or_default())
+			.map(|v| match v.as_bool() {
+				Ok(b) => b,
+				Err(e) => {
+					event!(
+						target: "cel",
+						tracing::Level::TRACE,
+						"failed to convert expression result to bool: {v:?}: {e}",
+					);
+					false
+				},
+			})
 			.unwrap_or_default()
 	}
 
@@ -773,6 +788,20 @@ pub struct LLMContext {
 	#[dynamic(rename = "inputTokens")]
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub input_tokens: Option<u64>,
+	/// The number of image tokens in the input/prompt.
+	#[dynamic(rename = "inputImageTokens")]
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub input_image_tokens: Option<u64>,
+	/// The number of text tokens in the input/prompt.
+	/// Note: this field is only set in multi-modal calls where the total token count is split out by
+	/// text/image/audio; for standard all-text calls, this is unset.
+	#[dynamic(rename = "inputTextTokens")]
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub input_text_tokens: Option<u64>,
+	/// The number of audio tokens in the input/prompt.
+	#[dynamic(rename = "inputAudioTokens")]
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub input_audio_tokens: Option<u64>,
 	/// The number of tokens in the input/prompt read from cache (savings)
 	#[dynamic(rename = "cachedInputTokens")]
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -786,6 +815,20 @@ pub struct LLMContext {
 	#[dynamic(rename = "outputTokens")]
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub output_tokens: Option<u64>,
+	/// The number of image tokens in the output/completion.
+	#[dynamic(rename = "outputImageTokens")]
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub output_image_tokens: Option<u64>,
+	/// The number of text tokens in the output/completion.
+	#[dynamic(rename = "outputTextTokens")]
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub output_text_tokens: Option<u64>,
+	/// The number of audio tokens in the output/completion.
+	/// Note: this field is only set in multi-modal calls where the total token count is split out by
+	/// text/image/audio; for standard all-text calls, this is unset.
+	#[dynamic(rename = "outputAudioTokens")]
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub output_audio_tokens: Option<u64>,
 	/// The number of reasoning tokens in the output/completion.
 	#[dynamic(rename = "reasoningTokens")]
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -794,6 +837,10 @@ pub struct LLMContext {
 	#[dynamic(rename = "totalTokens")]
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub total_tokens: Option<u64>,
+	/// The service tier the provider served the request under.
+	#[dynamic(rename = "serviceTier")]
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub service_tier: Option<Strng>,
 	// For now, not exposed to CEL; only used to piggy-back this field for metrics.
 	#[serde(skip)]
 	#[dynamic(skip)]
@@ -818,12 +865,19 @@ impl From<llm::LLMInfo> for LLMContext {
 		let resp = value.response;
 		let mut base = LLMContext {
 			output_tokens: resp.output_tokens,
+			output_image_tokens: resp.output_image_tokens,
+			output_text_tokens: resp.output_text_tokens,
+			output_audio_tokens: resp.output_audio_tokens,
 			count_tokens: resp.count_tokens,
 			total_tokens: resp.total_tokens,
 			first_token: resp.first_token,
 			reasoning_tokens: resp.reasoning_tokens,
+			input_image_tokens: resp.input_image_tokens,
+			input_text_tokens: resp.input_text_tokens,
+			input_audio_tokens: resp.input_audio_tokens,
 			cached_input_tokens: resp.cached_input_tokens,
 			cache_creation_input_tokens: resp.cache_creation_input_tokens,
+			service_tier: resp.service_tier.clone(),
 			response_model: resp.provider_model.clone(),
 			// Not always set
 			completion: resp.completion.clone(),
@@ -860,11 +914,18 @@ impl From<llm::LLMRequest> for LLMContext {
 			count_tokens: None,
 			response_model: None,
 			output_tokens: None,
+			output_image_tokens: None,
+			output_text_tokens: None,
+			output_audio_tokens: None,
 			total_tokens: None,
 			completion: None,
 			reasoning_tokens: None,
+			input_image_tokens: None,
+			input_text_tokens: None,
+			input_audio_tokens: None,
 			cached_input_tokens: None,
 			cache_creation_input_tokens: None,
+			service_tier: None,
 		}
 	}
 }
@@ -1242,7 +1303,7 @@ pub struct ExecutorSerde {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub llm: Option<LLMContext>,
 
-	/// `llm_request` contains the raw LLM request before processing. This is only present *during* LLM policies;
+	/// `llmRequest` contains the raw LLM request before processing. This is only present *during* LLM policies;
 	/// policies occurring after the LLM policy, such as logs, will not have this field present even for LLM requests.
 	#[serde(rename = "llmRequest", skip_serializing_if = "Option::is_none")]
 	pub llm_request: Option<serde_json::Value>,
@@ -1252,9 +1313,10 @@ pub struct ExecutorSerde {
 	pub source: Option<SourceContext>,
 
 	/// `mcp` contains attributes about the MCP request.
-	// This is only included for schema generation; see build_with_mcp.
+	/// Request-time CEL only includes identity fields such as `tool`, `prompt`, or `resource`.
+	/// Post-request CEL may also include fields like `methodName`, `sessionId`, and tool payloads.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub mcp: Option<ResourceType>,
+	pub mcp: Option<MCPInfo>,
 
 	/// `backend` contains information about the backend being used.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1430,11 +1492,18 @@ pub fn full_example_executor() -> ExecutorSerde {
 			response_model: Some("gpt-4-turbo".into()),
 			provider: "fake-ai".into(),
 			input_tokens: Some(100),
+			input_image_tokens: Some(60),
+			input_text_tokens: Some(40),
+			input_audio_tokens: Some(5),
 			cached_input_tokens: Some(20),
 			cache_creation_input_tokens: Some(10),
 			output_tokens: Some(50),
+			output_image_tokens: Some(30),
+			output_text_tokens: Some(20),
+			output_audio_tokens: Some(3),
 			reasoning_tokens: Some(30),
 			total_tokens: Some(150),
+			service_tier: Some("default".into()),
 			first_token: None,
 			count_tokens: Some(10),
 
@@ -1451,10 +1520,29 @@ pub fn full_example_executor() -> ExecutorSerde {
 				dimensions: None,
 			},
 		}),
-		mcp: Some(ResourceType::Tool(ResourceId::new(
-			"my-mcp-server".to_string(),
-			"get_weather".to_string(),
-		))),
+		mcp: Some(MCPInfo {
+			method_name: Some("tools/call".to_string()),
+			session_id: Some("session-123".to_string()),
+			tool: Some(MCPTool {
+				target: "my-mcp-server".to_string(),
+				name: "get_weather".to_string(),
+				arguments: Some(serde_json::Map::from_iter([(
+					"userId".to_string(),
+					json!("123"),
+				)])),
+				result: Some(json!({
+					"content": [],
+					"structuredContent": {
+						"status": "ok",
+						"forecast": "sunny",
+					},
+					"isError": false,
+				})),
+				error: None,
+			}),
+			prompt: None,
+			resource: None,
+		}),
 		backend: Some(BackendContext {
 			name: "my-backend".into(),
 			backend_type: BackendType::Service,

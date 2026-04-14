@@ -1,6 +1,6 @@
 use std::cmp;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU16;
@@ -479,6 +479,9 @@ pub enum BindProtocol {
 	// Note: TLS can be TLS (passthrough or termination) or HTTPS
 	tls,
 	tcp,
+	/// Auto-detect protocol by peeking at the first byte of each connection.
+	/// If the byte is 0x16 (TLS ClientHello), dispatch as `tls`; otherwise as `http`.
+	auto,
 }
 
 #[apply(schema!)]
@@ -509,6 +512,9 @@ pub type ListenerKey = Strng;
 pub struct Route {
 	// Internal name
 	pub key: RouteKey,
+	/// Service this route targets (set when parentRef is a Service).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub service_key: Option<crate::types::discovery::NamespacedHostname>,
 	#[serde(flatten)]
 	// User facing name of the route
 	pub name: RouteName,
@@ -740,6 +746,9 @@ impl BackendTargetRef<'_> {
 pub struct TCPRoute {
 	// Internal name
 	pub key: RouteKey,
+	/// Service this route targets (set when parentRef is a Service).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub service_key: Option<crate::types::discovery::NamespacedHostname>,
 	// User facing name of the route
 	#[serde(flatten)]
 	pub name: RouteName,
@@ -1305,13 +1314,39 @@ impl ListenerSet {
 	}
 
 	pub fn best_match(&self, host: &str) -> Option<Arc<Listener>> {
-		if let Some(best) = self.inner.values().find(|l| l.hostname == host) {
+		self.best_match_filtered(host, |_| true)
+	}
+
+	/// Match only listeners with HTTP protocol (no TLS).
+	pub fn best_match_http(&self, host: &str) -> Option<Arc<Listener>> {
+		self.best_match_filtered(host, |p| matches!(p, ListenerProtocol::HTTP))
+	}
+
+	/// Match only listeners with TLS-capable protocol (HTTPS or TLS).
+	pub fn best_match_tls(&self, host: &str) -> Option<Arc<Listener>> {
+		self.best_match_filtered(host, |p| {
+			matches!(p, ListenerProtocol::HTTPS(_) | ListenerProtocol::TLS(_))
+		})
+	}
+
+	fn best_match_filtered(
+		&self,
+		host: &str,
+		filter: impl Fn(&ListenerProtocol) -> bool,
+	) -> Option<Arc<Listener>> {
+		if let Some(best) = self
+			.inner
+			.values()
+			.filter(|l| filter(&l.protocol))
+			.find(|l| l.hostname == host)
+		{
 			trace!("found best match for {host} (exact)");
 			return Some(best.clone());
 		}
 		if let Some(best) = self
 			.inner
 			.values()
+			.filter(|l| filter(&l.protocol))
 			.sorted_by_key(|l| -(l.hostname.len() as i64))
 			.find(|l| l.hostname.starts_with("*") && host.ends_with(&l.hostname.as_str()[1..]))
 		{
@@ -1319,7 +1354,12 @@ impl ListenerSet {
 			return Some(best.clone());
 		}
 		trace!("trying to find best match for {host} (empty hostname)");
-		self.inner.values().find(|l| l.hostname.is_empty()).cloned()
+		self
+			.inner
+			.values()
+			.filter(|l| filter(&l.protocol))
+			.find(|l| l.hostname.is_empty())
+			.cloned()
 	}
 
 	pub fn insert(&mut self, v: Listener) {
@@ -1987,6 +2027,7 @@ pub enum FrontendPolicy {
 	HTTP(frontend::HTTP),
 	TLS(frontend::TLS),
 	TCP(frontend::TCP),
+	NetworkAuthorization(frontend::NetworkAuthorization),
 	AccessLog(frontend::LoggingPolicy),
 	Tracing(Arc<TracingPolicy>),
 }
@@ -2003,7 +2044,8 @@ pub enum TrafficPolicy {
 	RemoteRateLimit(remoteratelimit::RemoteRateLimit),
 	ExtAuthz(ext_authz::ExtAuthz),
 	ExtProc(ext_proc::ExtProc),
-	JwtAuth(crate::http::jwt::Jwt),
+	JwtAuth(JwtAuthentication),
+	Oidc(crate::http::oidc::OidcPolicy),
 	BasicAuth(crate::http::basicauth::BasicAuthentication),
 	APIKey(crate::http::apikey::APIKeyAuthentication),
 	Transformation(crate::http::transformation_cel::Transformation),
@@ -2091,6 +2133,49 @@ impl ResourceMetadata {
 		}
 
 		Value::Object(map)
+	}
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JwtAuthentication {
+	#[serde(flatten)]
+	pub jwt: crate::http::jwt::Jwt,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub mcp: Option<McpAuthentication>,
+}
+
+impl JwtAuthentication {
+	pub async fn apply(
+		&self,
+		client: &crate::proxy::httpproxy::PolicyClient,
+		log: Option<&mut crate::telemetry::log::RequestLog>,
+		req: &mut crate::http::Request,
+	) -> Result<(), crate::proxy::ProxyResponse> {
+		if let Some(auth) = &self.mcp {
+			if !crate::mcp::auth::is_well_known_endpoint(req.uri().path()) {
+				self.jwt.apply(log, req).await.map_err(|e| {
+					crate::proxy::ProxyResponse::from(crate::mcp::auth::create_auth_required_response(
+						crate::proxy::ProxyError::JwtAuthenticationFailure(e),
+						req,
+						auth,
+					))
+				})?;
+			}
+
+			if let Some(resp) = crate::mcp::auth::handle_mcp_request(req, auth, client).await? {
+				return Err(crate::proxy::ProxyResponse::DirectResponse(Box::new(resp)));
+			}
+			return Ok(());
+		}
+
+		self
+			.jwt
+			.apply(log, req)
+			.await
+			.map_err(crate::proxy::ProxyError::JwtAuthenticationFailure)
+			.map_err(crate::proxy::ProxyResponse::from)?;
+		Ok(())
 	}
 }
 
@@ -2227,13 +2312,11 @@ impl serde::Serialize for Target {
 	}
 }
 
-impl TryFrom<(&str, u16)> for Target {
-	type Error = anyhow::Error;
-
-	fn try_from((host, port): (&str, u16)) -> Result<Self, Self::Error> {
+impl From<(&str, u16)> for Target {
+	fn from((host, port): (&str, u16)) -> Self {
 		match host.parse::<IpAddr>() {
-			Ok(target) => Ok(Target::Address(SocketAddr::new(target, port))),
-			Err(_) => Ok(Target::Hostname(host.into(), port)),
+			Ok(target) => Target::Address(SocketAddr::new(target, port)),
+			Err(_) => Target::Hostname(host.into(), port),
 		}
 	}
 }
@@ -2250,7 +2333,7 @@ impl TryFrom<&str> for Target {
 			anyhow::bail!("invalid host:port: {hostport}");
 		};
 		let port: u16 = port.parse()?;
-		(host, port).try_into()
+		Ok((host, port).into())
 	}
 }
 
@@ -2339,6 +2422,7 @@ mod tests {
 	fn route(key: &'static str, hostnames: Vec<&'static str>, matches: Vec<RouteMatch>) -> Route {
 		Route {
 			key: strng::new(key),
+			service_key: None,
 			name: RouteName::default(),
 			hostnames: hostnames.into_iter().map(strng::new).collect(),
 			matches,
@@ -2350,6 +2434,7 @@ mod tests {
 	fn tcp_route(key: &'static str, hostnames: Vec<&'static str>) -> TCPRoute {
 		TCPRoute {
 			key: strng::new(key),
+			service_key: None,
 			name: RouteName::default(),
 			hostnames: hostnames.into_iter().map(strng::new).collect(),
 			backends: vec![],

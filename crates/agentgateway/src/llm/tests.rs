@@ -155,6 +155,7 @@ mod requests {
 		("basic", &[ANTHROPIC, BEDROCK]),
 		("full", &[ANTHROPIC, BEDROCK]),
 		("tool-call", &[ANTHROPIC, BEDROCK]),
+		("parallel-tool-call", &[BEDROCK]),
 		("reasoning", &[ANTHROPIC, BEDROCK]),
 		("reasoning_max", &[ANTHROPIC]),
 	];
@@ -167,6 +168,7 @@ mod requests {
 		("basic", &[BEDROCK]),
 		("instructions", &[BEDROCK]),
 		("input-list", &[BEDROCK]),
+		("parallel-tool-call", &[BEDROCK]),
 	];
 	pub const COUNT_TOKENS_REQUESTS: &[(&str, &[&str])] = &[
 		("basic", &[ANTHROPIC, BEDROCK, VERTEX]),
@@ -380,7 +382,8 @@ mod response {
 		BEDROCK_TO_RESPONSES,
 	];
 	const BEDROCK_RESPONSES: &[(&str, &[&str])] = &[("basic", ALL_BEDROCK), ("tool", ALL_BEDROCK)];
-	const BEDROCK_STREAM_RESPONSES: &[(&str, &[&str])] = &[("basic", ALL_BEDROCK)];
+	const BEDROCK_STREAM_RESPONSES: &[(&str, &[&str])] =
+		&[("basic", ALL_BEDROCK), ("tool", ALL_BEDROCK)];
 
 	const ALL_ANTHROPIC: &[&str] = &[
 		MESSAGES_TO_MESSAGES,
@@ -404,7 +407,10 @@ mod response {
 	];
 	const COMPLETIONS_RESPONSES: &[(&str, &[&str])] = &[
 		("basic", ALL_COMPLETIONS),
+		("audio", ALL_COMPLETIONS),
 		("openrouter_reasoning", ALL_COMPLETIONS),
+		("gemini_zero_completion_tokens", ALL_COMPLETIONS),
+		("gemini_with_completion_tokens", ALL_COMPLETIONS),
 	];
 	const COMPLETIONS_STREAM_RESPONSES: &[(&str, &[&str])] = &[("stream", ALL_COMPLETIONS)];
 
@@ -418,11 +424,13 @@ mod response {
 
 	const ALL_RESPONSES: &[&str] = &[RESPONSES_TO_RESPONSES, RESPONSES_TO_DETECT];
 	const RESPONSES_RESPONSES: &[(&str, &[&str])] = &[("basic", ALL_RESPONSES)];
-	const RESPONSES_STREAM_RESPONSES: &[(&str, &[&str])] = &[("stream", ALL_RESPONSES)];
+	const RESPONSES_STREAM_RESPONSES: &[(&str, &[&str])] =
+		&[("stream", ALL_RESPONSES), ("stream-image", ALL_RESPONSES)];
 
 	const DETECT_RESPONSES: &[(&str, &[&str])] = &[
 		("non-json", &[COMPLETIONS_TO_DETECT]),
 		("broken-sse", &[COMPLETIONS_TO_DETECT]),
+		("stream-image-generation", &[COMPLETIONS_TO_DETECT]),
 	];
 
 	#[tokio::test]
@@ -867,23 +875,27 @@ fn test_prompt_enrichment() {
 		"requests/policies/openai_with_messages.json",
 		apply_test_prompts,
 	);
+	test_request::<types::responses::Request>(
+		OPENAI,
+		"requests/policies/openai_with_text_input.json",
+		apply_test_prompts,
+	);
+	test_request::<types::responses::Request>(
+		OPENAI,
+		"requests/responses/assistant-history.json",
+		apply_test_prompts,
+	);
 }
 
 #[test]
 fn test_get_messages() {
 	use crate::llm::types::RequestType;
 
-	let input_path = fixture_path("requests/completions/full.json");
-	let input_str = &fs::read_to_string(&input_path).expect("Failed to read input file");
-	let input_raw: Value = serde_json::from_str(input_str).expect("Failed to parse input json");
-
-	fn extract_messages<R: RequestType + DeserializeOwned>(
-		input: &str,
-		path: &Path,
-		raw: &Value,
-		provider: &str,
-	) {
-		let request: R = serde_json::from_str(input).expect("Failed to parse json");
+	fn extract_messages<R: RequestType + DeserializeOwned>(fixture: &str, provider: &str) {
+		let path = fixture_path(fixture);
+		let input_str = fs::read_to_string(&path).expect("Failed to read input file");
+		let raw: Value = serde_json::from_str(&input_str).expect("Failed to parse input json");
+		let request: R = serde_json::from_str(&input_str).expect("Failed to parse json");
 
 		let out: Vec<Value> = request
 			.get_messages()
@@ -896,10 +908,9 @@ fn test_get_messages() {
 			})
 			.collect();
 
-		let (snapshot_path, snapshot_name) =
-			snapshot_path_and_name("requests/completions/full.json", provider);
+		let (snapshot_path, snapshot_name) = snapshot_path_and_name(fixture, provider);
 		insta::with_settings!({
-			info => raw,
+			info => &raw,
 			description => path.to_string_lossy().to_string(),
 			omit_expression => true,
 			prepend_module_to_snapshot => false,
@@ -910,15 +921,224 @@ fn test_get_messages() {
 	}
 
 	extract_messages::<types::completions::Request>(
-		input_str,
-		&input_path,
-		&input_raw,
+		"requests/completions/full.json",
 		"get-messages-completions",
 	);
 	extract_messages::<types::messages::Request>(
-		input_str,
-		&input_path,
-		&input_raw,
+		"requests/completions/full.json",
 		"get-messages-messages",
 	);
+	extract_messages::<types::responses::Request>(
+		"requests/responses/assistant-history.json",
+		"get-messages-responses",
+	);
+}
+
+/// Verifies that `process_response` routes a non-success response through
+/// the buffered error path even when the request has `streaming: true`.
+///
+/// Constructs a Bedrock 400 JSON error response and passes it through
+/// `process_response` with a streaming `LLMRequest`. Asserts the returned
+/// body is non-empty, valid JSON, and preserves the original error message.
+#[tokio::test]
+async fn process_response_routes_streaming_error_to_buffered_path() {
+	use crate::proxy::httpproxy::PolicyClient;
+	use crate::test_helpers::proxymock::setup_proxy_test;
+
+	let bedrock = AIProvider::Bedrock(bedrock::Provider {
+		model: Some(strng::new("anthropic.claude-3-5-sonnet-20241022-v2:0")),
+		region: strng::new("us-west-2"),
+		guardrail_identifier: None,
+		guardrail_version: None,
+	});
+
+	let error_json = r#"{"message":"Expected toolResult blocks at messages.2.content for the following Ids: tooluse_abc123"}"#;
+
+	let req = LLMRequest {
+		input_tokens: None,
+		input_format: InputFormat::Completions,
+		request_model: "input-model".into(),
+		provider: Default::default(),
+		streaming: true,
+		params: Default::default(),
+		prompt: None,
+	};
+
+	let body = Body::from(error_json.as_bytes().to_vec());
+	let mut resp = Response::new(body);
+	*resp.status_mut() = ::http::StatusCode::BAD_REQUEST;
+	resp.headers_mut().insert(
+		::http::header::CONTENT_TYPE,
+		"application/json".parse().unwrap(),
+	);
+
+	let client = PolicyClient {
+		inputs: setup_proxy_test("{}").unwrap().pi,
+	};
+
+	let result = bedrock
+		.process_response(
+			client,
+			req,
+			LLMResponsePolicies::default(),
+			AsyncLog::default(),
+			false,
+			resp,
+		)
+		.await
+		.expect("process_response should succeed for error responses");
+
+	assert_eq!(result.status(), ::http::StatusCode::BAD_REQUEST);
+
+	let result_body = result.collect().await.unwrap().to_bytes();
+	assert!(
+		!result_body.is_empty(),
+		"error response body must not be empty",
+	);
+
+	let parsed: Value =
+		serde_json::from_slice(&result_body).expect("translated error should be valid JSON");
+
+	let message = parsed
+		.pointer("/error/message")
+		.and_then(|v| v.as_str())
+		.unwrap_or_default();
+	assert!(
+		message.contains("toolResult"),
+		"translated error should preserve the original message, got: {message}",
+	);
+}
+
+#[tokio::test]
+async fn process_streaming_bedrock_completions_normalizes_sse_headers_and_done() {
+	let bedrock = AIProvider::Bedrock(bedrock::Provider {
+		model: Some(strng::new("openai.gpt-oss-120b-1:0")),
+		region: strng::new("us-east-1"),
+		guardrail_identifier: None,
+		guardrail_version: None,
+	});
+
+	let body = Body::from(
+		fs::read(fixture_path("response/bedrock/basic.bin"))
+			.expect("failed to read Bedrock streaming fixture"),
+	);
+	let mut resp = Response::new(body);
+	resp.headers_mut().insert(
+		::http::header::CONTENT_TYPE,
+		"application/vnd.amazon.eventstream".parse().unwrap(),
+	);
+	resp.headers_mut().insert(
+		crate::http::x_headers::X_AMZN_REQUESTID,
+		"request_id".parse().unwrap(),
+	);
+
+	let translated = bedrock
+		.process_streaming(
+			LLMRequest {
+				input_tokens: None,
+				input_format: InputFormat::Completions,
+				request_model: "input-model".into(),
+				provider: Default::default(),
+				streaming: true,
+				params: Default::default(),
+				prompt: None,
+			},
+			LLMResponsePolicies::default(),
+			AsyncLog::default(),
+			false,
+			resp,
+		)
+		.await
+		.expect("Bedrock streaming translation should succeed");
+
+	crate::http::tests_common::assert_header(
+		&translated,
+		::http::header::CONTENT_TYPE,
+		"text/event-stream",
+	);
+
+	let body = translated.collect().await.unwrap().to_bytes();
+	let text = String::from_utf8(body.to_vec()).expect("stream should be valid UTF-8");
+	assert!(
+		text.ends_with("data: [DONE]\n\n"),
+		"translated Bedrock completions stream must end with [DONE], got:\n{text}",
+	);
+	assert!(
+		!text.contains("event: \n"),
+		"translated Bedrock completions stream must not emit empty event fields:\n{text}",
+	);
+}
+
+#[test]
+fn setup_request_openai_applies_prefixed_path_without_host_override() {
+	let provider = AIProvider::OpenAI(openai::Provider { model: None });
+	let mut req = crate::http::tests_common::request(
+		"https://example.com/v1/messages?trace=repro",
+		http::Method::POST,
+		&[],
+	);
+
+	provider
+		.setup_request(
+			&mut req,
+			RouteType::Messages,
+			None,
+			None,
+			Some("/v1/custom"),
+			false,
+		)
+		.expect("setup_request should succeed");
+
+	assert_eq!(
+		req.uri().authority().map(|a| a.as_str()),
+		Some("api.openai.com")
+	);
+	assert_eq!(req.uri().path(), "/v1/custom/chat/completions");
+	assert_eq!(req.uri().query(), Some("trace=repro"));
+}
+
+#[test]
+fn setup_request_openai_normalizes_trailing_slash_in_path_prefix() {
+	let provider = AIProvider::OpenAI(openai::Provider { model: None });
+	let mut req = crate::http::tests_common::request(
+		"https://example.com/v1/messages?trace=repro",
+		http::Method::POST,
+		&[],
+	);
+
+	provider
+		.setup_request(
+			&mut req,
+			RouteType::Messages,
+			None,
+			None,
+			Some("/v1/custom/"),
+			false,
+		)
+		.expect("setup_request should succeed");
+
+	assert_eq!(req.uri().path(), "/v1/custom/chat/completions");
+	assert_eq!(req.uri().query(), Some("trace=repro"));
+}
+
+#[test]
+fn completions_response_missing_message_and_usage_fields() {
+	// Gemini's OpenAI-compat endpoint can omit `message` from choices and
+	// `completion_tokens` from usage. Verify deserialization succeeds with defaults.
+	let json = r#"{
+		"id": "1",
+		"object": "chat.completion",
+		"created": 0,
+		"model": "google/gemini-2.5-flash",
+		"choices": [{"index": 0, "finish_reason": "length"}],
+		"usage": {"prompt_tokens": 5, "total_tokens": 12}
+	}"#;
+	let resp: types::completions::Response = serde_json::from_str(json).unwrap();
+	assert_eq!(resp.choices.len(), 1);
+	assert_eq!(resp.choices[0].message.content, None);
+	assert_eq!(resp.choices[0].message.role, None);
+	let usage = resp.usage.unwrap();
+	assert_eq!(usage.prompt_tokens, 5);
+	assert_eq!(usage.completion_tokens, 0);
+	assert_eq!(usage.total_tokens, 12);
 }

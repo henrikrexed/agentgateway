@@ -14,7 +14,6 @@ use agent_core::telemetry::{OptionExt, OtelLogSink, ValueBag, debug, display};
 use bytes::Buf;
 use crossbeam::atomic::AtomicCell;
 use frozen_collections::FzHashSet;
-use frozen_collections::SetQuery;
 use http_body::{Body, Frame, SizeHint};
 use indexmap::IndexMap;
 use itertools::Itertools;
@@ -32,7 +31,7 @@ use crate::cel::{ContextBuilder, Expression, LLMContext};
 use crate::http::Request;
 use crate::http::health;
 use crate::llm::InputFormat;
-use crate::mcp::{MCPOperation, ResourceId, ResourceType};
+use crate::mcp::{MCPInfo, MCPOperation};
 use crate::proxy::ProxyResponseReason;
 use crate::telemetry::metrics::{
 	GenAILabels, GenAILabelsTokenUsage, HTTPLabels, MCPCall, Metrics, RouteIdentifier,
@@ -403,35 +402,42 @@ impl CelLogging {
 		&mut self.cel_context
 	}
 
-	pub fn build<'a>(
-		&'a self,
-		req: Option<&'a cel::RequestSnapshot>,
-		resp: Option<&'a cel::ResponseSnapshot>,
-		llm_response: Option<&'a LLMContext>,
-		mcp: Option<&'a ResourceType>,
-		end_time: Option<&'a cel::RequestTime>,
-		source_context: Option<&'a cel::SourceContext>,
-	) -> Result<CelLoggingExecutor<'a>, cel::Error> {
+	pub fn build<'a>(&'a self, inputs: CelLoggingBuildInputs<'a>) -> CelLoggingExecutor<'a> {
 		let CelLogging {
 			cel_context: _,
 			filter,
 			fields,
 			metric_fields,
 		} = self;
-		let executor = if req.is_none() && source_context.is_some() {
+		let executor = if inputs.req.is_none() && inputs.source_context.is_some() {
 			// TCP case: use new_tcp_logger
-			cel::Executor::new_tcp_logger(source_context, end_time)
+			cel::Executor::new_tcp_logger(inputs.source_context, inputs.end_time)
 		} else {
 			// HTTP case: use new_logger
-			cel::Executor::new_logger(req, resp, llm_response, mcp, end_time)
+			cel::Executor::new_logger(
+				inputs.req,
+				inputs.resp,
+				inputs.llm_response,
+				inputs.mcp,
+				Some(inputs.end_time),
+			)
 		};
-		Ok(CelLoggingExecutor {
+		CelLoggingExecutor {
 			executor,
 			filter,
 			fields,
 			metric_fields,
-		})
+		}
 	}
+}
+
+pub struct CelLoggingBuildInputs<'a> {
+	pub req: Option<&'a cel::RequestSnapshot>,
+	pub resp: Option<&'a cel::ResponseSnapshot>,
+	pub llm_response: Option<&'a LLMContext>,
+	pub mcp: Option<&'a MCPInfo>,
+	pub end_time: &'a cel::RequestTime,
+	pub source_context: Option<&'a cel::SourceContext>,
 }
 
 #[derive(Debug)]
@@ -455,7 +461,7 @@ impl DropOnLog {
 	/// Computes (health, eviction_duration, restore_health) for finish_request.
 	/// `unhealthy` should already be evaluated (preferably with the shared CEL executor when available).
 	/// When no CEL expression is set, the default treats 4xx, 5xx, or connection failures as unhealthy.
-	fn eviction_unhealthy(log: &RequestLog, cel_exec: Option<&CelLoggingExecutor<'_>>) -> bool {
+	fn eviction_unhealthy(log: &RequestLog, cel_exec: &CelLoggingExecutor<'_>) -> bool {
 		let default_unhealthy = log.status.is_none_or(|s| s.is_server_error());
 		let Some(policy) = &log.health_policy else {
 			return default_unhealthy;
@@ -463,10 +469,7 @@ impl DropOnLog {
 		let Some(expr) = &policy.unhealthy_expression else {
 			return default_unhealthy;
 		};
-		match cel_exec {
-			Some(cel_exec) => cel_exec.executor.eval_bool(expr.as_ref()),
-			None => default_unhealthy,
-		}
+		cel_exec.executor.eval_bool(expr.as_ref())
 	}
 
 	/// Returns (health, eviction_duration, restore_health).
@@ -756,59 +759,30 @@ impl Drop for DropOnLog {
 			custom: CustomField::default(),
 		};
 
-		let enable_custom_metrics = !log.cel.metric_fields.add.is_empty();
-
 		// Always run request_handle/finish_request first so LLM provider eviction (failover) runs
 		// even when logging/tracing/metrics are disabled.
 		let end_time = Timestamp::now();
 		let duration = end_time.duration_since(&log.start);
 		let enable_trace = log.tracer.is_some();
-		// We will later check it also matches a filter, but filter is slower
-		let maybe_enable_log = agent_core::telemetry::enabled("request", &Level::INFO);
 
 		let llm_response = log.llm_response.take().map(Into::into);
 
 		let mcp = log.mcp_status.take();
-		let mcp_cel = mcp.as_ref().and_then(|m| {
-			let resource = ResourceId::new(
-				m.target_name.as_deref()?.to_string(),
-				m.resource_name.as_deref()?.to_string(),
-			);
-			match m.resource {
-				Some(MCPOperation::Prompt) => Some(ResourceType::Prompt(resource)),
-				Some(MCPOperation::Tool) => Some(ResourceType::Tool(resource)),
-				Some(MCPOperation::Resource) => Some(ResourceType::Resource(resource)),
-				_ => None,
-			}
+		let mcp_cel = mcp.as_ref().filter(|m| !m.is_empty());
+		let cel_end_time = cel::RequestTime(end_time.as_datetime());
+		let cel_exec = log.cel.build(CelLoggingBuildInputs {
+			req: log.request_snapshot.as_ref(),
+			resp: log.response_snapshot.as_ref(),
+			llm_response: llm_response.as_ref(),
+			mcp: mcp_cel,
+			end_time: &cel_end_time,
+			source_context: log.source_context.as_ref(),
 		});
-		let needs_cel_for_outputs = maybe_enable_log || enable_trace || enable_custom_metrics;
-		let needs_cel_for_eviction = log
-			.health_policy
-			.as_ref()
-			.is_some_and(|p| p.unhealthy_expression.is_some());
-		let cel_end_time = (needs_cel_for_outputs || needs_cel_for_eviction)
-			.then(|| cel::RequestTime(end_time.as_datetime()));
-		let cel_exec = if needs_cel_for_outputs || needs_cel_for_eviction {
-			log
-				.cel
-				.build(
-					log.request_snapshot.as_ref(),
-					log.response_snapshot.as_ref(),
-					llm_response.as_ref(),
-					mcp_cel.as_ref(),
-					cel_end_time.as_ref(),
-					log.source_context.as_ref(),
-				)
-				.ok()
-		} else {
-			None
-		};
-
 		if let Some(rh) = log.request_handle.take() {
 			let current_health = rh.health_score();
 			let consecutive_failures = rh.consecutive_failures();
 			let times_ejected = rh.times_ejected();
-			let unhealthy = Self::eviction_unhealthy(&log, cel_exec.as_ref());
+			let unhealthy = Self::eviction_unhealthy(&log, &cel_exec);
 			let (health, eviction_duration, restore_health) = Self::eviction_decision(
 				&log,
 				current_health,
@@ -818,17 +792,6 @@ impl Drop for DropOnLog {
 			);
 			rh.finish_request(health, duration, eviction_duration, restore_health);
 		}
-		if !maybe_enable_log && !enable_trace && !enable_custom_metrics {
-			// Report our non-customized metrics
-			if !is_tcp {
-				log.metrics.requests.get_or_create(&http_labels).inc();
-			}
-			return;
-		}
-		let Some(cel_exec) = cel_exec else {
-			tracing::warn!("failed to build CEL context");
-			return;
-		};
 
 		let custom_metric_fields = CustomField::new(
 			// For metrics, keep empty values which will become 'unknown'
@@ -863,6 +826,14 @@ impl Drop for DropOnLog {
 			.get_or_create(&http_labels)
 			.observe(duration.as_secs_f64());
 
+		if let Some(retry_count) = log.retry_attempt {
+			log
+				.metrics
+				.retries
+				.get_or_create(&http_labels)
+				.inc_by(retry_count as u64);
+		}
+
 		if llm_response.is_some() {
 			let _llm_span = log.span_writer().start("llm");
 			Self::add_llm_metrics(
@@ -887,9 +858,9 @@ impl Drop for DropOnLog {
 				.mcp_requests
 				.get_or_create(&MCPCall {
 					method: mcp.method_name.as_ref().map(RichStrng::from).into(),
-					resource_type: mcp.resource.into(),
-					server: mcp.target_name.as_ref().map(RichStrng::from).into(),
-					resource: mcp.resource_name.as_ref().map(RichStrng::from).into(),
+					resource_type: mcp.resource_type().into(),
+					server: mcp.target_name().map(RichStrng::from).into(),
+					resource: mcp.resource_name().map(RichStrng::from).into(),
 
 					route: route_identifier.clone(),
 					custom: custom_metric_fields.clone(),
@@ -897,6 +868,7 @@ impl Drop for DropOnLog {
 				.inc();
 		}
 
+		let maybe_enable_log = agent_core::telemetry::enabled("request", &Level::INFO);
 		let enable_logs = maybe_enable_log && cel_exec.eval_filter();
 		if !enable_logs && !enable_trace {
 			return;
@@ -909,11 +881,22 @@ impl Drop for DropOnLog {
 
 		let trace_id = log.outgoing_span.as_ref().map(|id| id.trace_id());
 		let span_id = log.outgoing_span.as_ref().map(|id| id.span_id());
-
 		let fields = cel_exec.fields;
 		let reason = log.reason.and_then(|r| match r {
 			ProxyResponseReason::Upstream => None,
 			_ => Some(r),
+		});
+		let mcp_target = mcp
+			.as_ref()
+			.and_then(|m| m.target_name())
+			.map(str::to_owned);
+		let mcp_resource_type = mcp.as_ref().and_then(|m| m.resource_type());
+		let mcp_resource_uri = mcp.as_ref().and_then(|m| {
+			if matches!(m.resource_type(), Some(MCPOperation::Resource)) {
+				m.resource_name().map(str::to_owned)
+			} else {
+				None
+			}
 		});
 
 		let mut kv = vec![
@@ -959,37 +942,9 @@ impl Drop for DropOnLog {
 					.and_then(|m| m.method_name.as_ref())
 					.map(display),
 			),
-			(
-				"gen_ai.tool.name",
-				mcp.as_ref().and_then(|m| {
-					if matches!(m.resource, Some(MCPOperation::Tool)) {
-						m.resource_name.as_ref().map(display)
-					} else {
-						None
-					}
-				}),
-			),
-			(
-				"mcp.target",
-				mcp
-					.as_ref()
-					.and_then(|m| m.target_name.as_ref())
-					.map(display),
-			),
-			(
-				"mcp.resource.type",
-				mcp.as_ref().and_then(|m| m.resource.as_ref()).map(display),
-			),
-			(
-				"mcp.resource.uri",
-				mcp.as_ref().and_then(|m| {
-					if matches!(m.resource, Some(MCPOperation::Resource)) {
-						m.resource_name.as_ref().map(display)
-					} else {
-						None
-					}
-				}),
-			),
+			("mcp.target", mcp_target.as_ref().map(display)),
+			("mcp.resource.type", mcp_resource_type.as_ref().map(display)),
+			("mcp.resource.uri", mcp_resource_uri.as_ref().map(display)),
 			(
 				"mcp.session.id",
 				mcp
@@ -1028,10 +983,40 @@ impl Drop for DropOnLog {
 			),
 			("gen_ai.usage.input_tokens", input_tokens.map(Into::into)),
 			(
+				"gen_ai.usage.cache_creation.input_tokens",
+				llm_response
+					.as_ref()
+					.and_then(|l| l.cache_creation_input_tokens)
+					.map(Into::into),
+			),
+			(
+				"gen_ai.usage.cache_read.input_tokens",
+				llm_response
+					.as_ref()
+					.and_then(|l| l.cached_input_tokens)
+					.map(Into::into),
+			),
+			(
 				"gen_ai.usage.output_tokens",
 				llm_response
 					.as_ref()
 					.and_then(|l| l.output_tokens)
+					.map(Into::into),
+			),
+			// Not part of official semconv
+			(
+				"gen_ai.usage.output_image_tokens",
+				llm_response
+					.as_ref()
+					.and_then(|l| l.output_image_tokens)
+					.map(Into::into),
+			),
+			// Not part of official semconv
+			(
+				"gen_ai.usage.output_audio_tokens",
+				llm_response
+					.as_ref()
+					.and_then(|l| l.output_audio_tokens)
 					.map(Into::into),
 			),
 			(

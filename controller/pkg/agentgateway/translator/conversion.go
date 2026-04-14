@@ -34,9 +34,9 @@ import (
 	"github.com/agentgateway/agentgateway/api"
 	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/plugins"
 	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/utils"
-	"github.com/agentgateway/agentgateway/controller/pkg/kgateway/wellknown"
 	"github.com/agentgateway/agentgateway/controller/pkg/pluginsdk/reporter"
 	"github.com/agentgateway/agentgateway/controller/pkg/utils/kubeutils"
+	"github.com/agentgateway/agentgateway/controller/pkg/wellknown"
 )
 
 // ConvertHTTPRouteToAgw converts a HTTPRouteRule to an agentgateway HTTPRoute
@@ -604,19 +604,6 @@ func buildAgwDestination(
 	ns string,
 	k schema.GroupVersionKind,
 ) (*api.RouteBackend, *reporter.RouteCondition) {
-	ref := NormalizeReference(to.Group, to.Kind, wellknown.ServiceGVK)
-	// check if the reference is allowed
-	if toNs := to.Namespace; toNs != nil && string(*toNs) != ns {
-		if !ctx.Grants.BackendAllowed(ctx.Krt, k, to.Name, *toNs, ns, ref) {
-			return nil, &reporter.RouteCondition{
-				Type:    gwv1.RouteConditionResolvedRefs,
-				Status:  metav1.ConditionFalse,
-				Reason:  gwv1.RouteReasonRefNotPermitted,
-				Message: fmt.Sprintf("backendRef %v/%v not accessible to a %s in namespace %q (missing a ReferenceGrant?)", to.Name, *toNs, k.Kind, ns),
-			}
-		}
-	}
-
 	weight := int32(1) // default
 	if to.Weight != nil {
 		weight = *to.Weight
@@ -624,16 +611,27 @@ func buildAgwDestination(
 	rb := &api.RouteBackend{
 		Weight: weight,
 	}
+	ref := NormalizeReference(to.Group, to.Kind, wellknown.ServiceGVK)
+	// check if the reference is allowed
+	if toNs := to.Namespace; toNs != nil && string(*toNs) != ns {
+		if !ctx.Grants.BackendAllowed(ctx.Krt, k, to.Name, *toNs, ns, ref) {
+			return rb, &reporter.RouteCondition{
+				Type:    gwv1.RouteConditionResolvedRefs,
+				Status:  metav1.ConditionFalse,
+				Reason:  gwv1.RouteReasonRefNotPermitted,
+				Message: fmt.Sprintf("backendRef %v/%v not accessible to a %s in namespace %q (missing a ReferenceGrant?)", to.Name, *toNs, k.Kind, ns),
+			}
+		}
+	}
 	backendRef, err := ctx.References.RouteBackend(ctx.Krt, ns, ref.GroupKind(), to.Name, to.Namespace, to.Port)
+	// Even in the error case, we still populate a partial backend
+	rb.Backend = backendRef
 	if err != nil {
 		var backendErr *plugins.BackendReferenceError
 		if errors.As(err, &backendErr) {
-			if backendErr.Backend != nil {
-				rb.Backend = backendErr.Backend
-			}
 			switch backendErr.Reason {
 			case plugins.BackendReferenceErrorReasonUnsupportedValue:
-				return nil, &reporter.RouteCondition{
+				return rb, &reporter.RouteCondition{
 					Type:    gwv1.RouteConditionAccepted,
 					Status:  metav1.ConditionFalse,
 					Reason:  gwv1.RouteReasonUnsupportedValue,
@@ -647,7 +645,7 @@ func buildAgwDestination(
 					Message: backendErr.Message,
 				}
 			case plugins.BackendReferenceErrorReasonInvalidKind:
-				return nil, &reporter.RouteCondition{
+				return rb, &reporter.RouteCondition{
 					Type:    gwv1.RouteConditionResolvedRefs,
 					Status:  metav1.ConditionFalse,
 					Reason:  gwv1.RouteReasonInvalidKind,
@@ -655,14 +653,13 @@ func buildAgwDestination(
 				}
 			}
 		}
-		return nil, &reporter.RouteCondition{
+		return rb, &reporter.RouteCondition{
 			Type:    gwv1.RouteConditionResolvedRefs,
 			Status:  metav1.ConditionFalse,
 			Reason:  gwv1.RouteReasonInvalidKind,
 			Message: err.Error(),
 		}
 	}
-	rb.Backend = backendRef
 	return rb, nil
 }
 
@@ -736,11 +733,12 @@ func ReferenceAllowed(
 	hostnames []gwv1.Hostname,
 	localNamespace string,
 ) *ParentError {
-	if parentRef.Kind == wellknown.ServiceGVK.Kind {
+	if parent.ServiceKey != nil {
+		// Parent resolver already verified this reference exists.
+	} else if parentRef.Kind == wellknown.ServiceGVK.Kind {
+		// check that the referenced svc exists
 		key := parentRef.Namespace + "/" + parentRef.Name
 		svc := ptr.Flatten(krt.FetchOne(ctx.Krt, ctx.Services, krt.FilterKey(key)))
-
-		// check that the referenced svc exists
 		if svc == nil {
 			return &ParentError{
 				Reason:  ParentErrorNotAccepted,
@@ -840,7 +838,7 @@ func ReferenceAllowed(
 	return nil
 }
 
-func extractParentReferenceInfo(ctx RouteContext, parents RouteParents, obj controllers.Object) []RouteParentReference {
+func extractParentReferenceInfo(ctx RouteContext, parents ParentResolver, obj controllers.Object) []RouteParentReference {
 	routeRefs, hostnames, kind := GetCommonRouteInfo(obj)
 	localNamespace := obj.GetNamespace()
 	var parentRefs []RouteParentReference
@@ -855,7 +853,7 @@ func extractParentReferenceInfo(ctx RouteContext, parents RouteParents, obj cont
 			Port:                ptr.OrEmpty(ref.Port),
 		}
 		gk := ir
-		currentParents := parents.Fetch(ctx.Krt, gk)
+		currentParents := parents.ParentsFor(ctx.Krt, gk)
 		appendParent := func(pr *ParentInfo, pk ParentReference) {
 			bannedHostnames := sets.New[string]()
 			for _, gw := range currentParents {
@@ -875,6 +873,7 @@ func extractParentReferenceInfo(ctx RouteContext, parents RouteParents, obj cont
 			rpi := RouteParentReference{
 				ParentGateway:     pr.ParentGateway,
 				ListenerKey:       pr.ListenerKey,
+				ServiceKey:        pr.ServiceKey,
 				InternalKind:      ir.Kind,
 				Hostname:          pr.OriginalHostname,
 				DeniedReason:      deniedReason,
@@ -916,33 +915,14 @@ func (p ParentReference) String() string {
 	return p.TypedNamespacedName.String() + "/" + string(p.SectionName) + "/" + fmt.Sprint(p.Port)
 }
 
-// ParentInfo holds info about a "Parent" - something that can be referenced as a ParentRef in the API.
-// Today, this is just Gateway
-type ParentInfo struct {
-	ParentGateway          types.NamespacedName
-	ParentGatewayClassName string
-	// ListenerKey is the internal key of the listener resource created for this parent.
-	ListenerKey string
-	// AllowedKinds indicates which kinds can be admitted by this Parent
-	AllowedKinds []gwv1.RouteGroupKind
-	// Hostnames is the hostnames that must be match to reference to the Parent. For gateway this is listener hostname
-	// Format is ns/hostname
-	Hostnames []string
-	// OriginalHostname is the unprocessed form of Hostnames; how it appeared in users' config
-	OriginalHostname string
-	// Timestamp the parent was created - used in determining listener precedence
-	CreationTimestamp metav1.Time
-
-	SectionName    gwv1.SectionName
-	Port           gwv1.PortNumber
-	Protocol       gwv1.ProtocolType
-	TLSPassthrough bool
-}
+type ParentInfo = plugins.ParentInfo
 
 // RouteParentReference holds information about a route's parent reference
 type RouteParentReference struct {
 	// ListenerKey is the internal key of the listener resource created for this parent.
 	ListenerKey string
+	// ServiceKey (optionally) links a parent reference to an individual Service.
+	ServiceKey *types.NamespacedName
 	// InternalKind is the Kind of the Parent
 	InternalKind string
 	// DeniedReason, if present, indicates why the reference was not valid

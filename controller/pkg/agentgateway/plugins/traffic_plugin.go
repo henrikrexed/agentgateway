@@ -15,6 +15,7 @@ import (
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/kube/controllers"
 	"istio.io/istio/pkg/kube/krt"
+	"istio.io/istio/pkg/maps"
 	"istio.io/istio/pkg/ptr"
 	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/util/protomarshal"
@@ -31,10 +32,10 @@ import (
 	"github.com/agentgateway/agentgateway/controller/api/v1alpha1/shared"
 	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/jwks_url"
 	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/utils"
-	"github.com/agentgateway/agentgateway/controller/pkg/kgateway/wellknown"
 	"github.com/agentgateway/agentgateway/controller/pkg/logging"
 	"github.com/agentgateway/agentgateway/controller/pkg/pluginsdk/reporter"
 	"github.com/agentgateway/agentgateway/controller/pkg/reports"
+	"github.com/agentgateway/agentgateway/controller/pkg/wellknown"
 )
 
 const (
@@ -134,25 +135,27 @@ func TranslateAgentgatewayPolicy(ctx krt.HandlerContext, policy *agentgateway.Ag
 	for _, target := range policy.Spec.TargetRefs {
 		gk := schema.GroupKind{Group: string(target.Group), Kind: string(target.Kind)}
 
-		policyTarget, targetExists := references.PolicyTarget(ctx, policy.Namespace, target.Name, gk, target.SectionName)
-		if policyTarget == nil {
+		policyTargets, targetExists := references.PolicyTarget(ctx, policy.Namespace, target.Name, gk, target.SectionName)
+		if len(policyTargets) == 0 {
 			// This should be impossible, verified by CEL validation
 			logger.Warn("unsupported target kind", "kind", target.Kind, "policy", policy.Name)
 			continue
 		}
 
-		gatewayTargets := references.LookupGatewaysForTarget(ctx, utils.TypedNamespacedName{
+		gatewayTargets := references.LookupGatewaysForBackend(ctx, utils.TypedNamespacedName{
 			NamespacedName: types.NamespacedName{Namespace: policy.Namespace, Name: string(target.Name)},
 			Kind:           gk.Kind,
 		}).UnsortedList()
 
-		translatedPolicies := clonePoliciesForTarget(baseTranslatedPolicies, policyTarget)
-		for _, translatedPolicy := range translatedPolicies {
-			for _, gatewayTarget := range gatewayTargets {
-				agwPolicies = append(agwPolicies, AgwPolicy{
-					Gateway: ptr.Of(gatewayTarget),
-					Policy:  translatedPolicy,
-				})
+		for _, policyTarget := range policyTargets {
+			translatedPolicies := clonePoliciesForTarget(baseTranslatedPolicies, policyTarget)
+			for _, translatedPolicy := range translatedPolicies {
+				for _, gatewayTarget := range gatewayTargets {
+					agwPolicies = append(agwPolicies, AgwPolicy{
+						Gateway: ptr.Of(gatewayTarget),
+						Policy:  translatedPolicy,
+					})
+				}
 			}
 		}
 
@@ -301,7 +304,7 @@ func resolvePolicyAncestorRefs(
 		NamespacedName: types.NamespacedName{Namespace: policyNamespace, Name: string(targetName)},
 		Kind:           targetGK.Kind,
 	}
-	gatewayTargets := references.LookupGatewaysForTarget(ctx, object).UnsortedList()
+	gatewayTargets := references.LookupGatewaysForBackend(ctx, object).UnsortedList()
 	if len(gatewayTargets) == 0 {
 		return nil, fmt.Sprintf("Policy is not attached: %s %s/%s is not attached to any Gateway", targetGK.Kind, policyNamespace, targetName)
 	}
@@ -416,7 +419,7 @@ func translateTrafficPolicyToAgw(
 
 	// Convert Authorization policy if present
 	if traffic.Authorization != nil {
-		appendPolicy("authorization")(processAuthorizationPolicy(traffic.Authorization, basePolicyName, policyName), nil)
+		appendPolicy("authorization")(processAuthorizationPolicy(traffic.Authorization, basePolicyName, policyName))
 	}
 
 	// Process RateLimit policies if present
@@ -584,6 +587,19 @@ func processJWTAuthenticationPolicy(ctx PolicyCtx, jwt *agentgateway.JWTAuthenti
 			}
 			jp.JwksSource = &api.TrafficPolicySpec_JWTProvider_Inline{Inline: inline}
 			p.Providers = append(p.Providers, jp)
+		}
+	}
+
+	if jwt.MCP != nil {
+		if len(jwt.Providers) != 1 {
+			errs = append(errs, fmt.Errorf("jwtAuthentication.mcp requires exactly one provider, found %d", len(jwt.Providers)))
+		} else {
+			mcp, err := translateJWTMCPConfig(jwt.MCP)
+			if err != nil {
+				errs = append(errs, err)
+			} else {
+				p.Mcp = mcp
+			}
 		}
 	}
 
@@ -879,23 +895,38 @@ func processExtAuthPolicy(
 
 	spec := &api.TrafficPolicySpec_ExternalAuth{
 		Target:      be,
-		FailureMode: api.TrafficPolicySpec_ExternalAuth_DENY,
+		FailureMode: extAuthFailureMode(extAuth.FailureMode),
 	}
 	if g := extAuth.GRPC; g != nil {
+		metadata := castCELMap(g.RequestMetadata, func(key string, expr shared.CELExpression) {
+			errs = append(errs, fmt.Errorf("extAuth grpc requestMetadata %q is not a valid CEL expression: %s", key, expr))
+		})
 		p := &api.TrafficPolicySpec_ExternalAuth_GRPCProtocol{
 			Context:  g.ContextExtensions,
-			Metadata: castMap(g.RequestMetadata),
+			Metadata: metadata,
 		}
 		spec.Protocol = &api.TrafficPolicySpec_ExternalAuth_Grpc{
 			Grpc: p,
 		}
 	} else if h := extAuth.HTTP; h != nil {
+		path := castCELPtr(h.Path, func(expr shared.CELExpression) {
+			errs = append(errs, fmt.Errorf("extAuth http path is not a valid CEL expression: %s", expr))
+		})
+		redirect := castCELPtr(h.Redirect, func(expr shared.CELExpression) {
+			errs = append(errs, fmt.Errorf("extAuth http redirect is not a valid CEL expression: %s", expr))
+		})
+		addRequestHeaders := castCELMap(h.AddRequestHeaders, func(key string, expr shared.CELExpression) {
+			errs = append(errs, fmt.Errorf("extAuth http addRequestHeaders %q is not a valid CEL expression: %s", key, expr))
+		})
+		metadata := castCELMap(h.ResponseMetadata, func(key string, expr shared.CELExpression) {
+			errs = append(errs, fmt.Errorf("extAuth http responseMetadata %q is not a valid CEL expression: %s", key, expr))
+		})
 		p := &api.TrafficPolicySpec_ExternalAuth_HTTPProtocol{
-			Path:                   castPtr(h.Path),
-			Redirect:               castPtr(h.Redirect),
+			Path:                   path,
+			Redirect:               redirect,
 			IncludeResponseHeaders: h.AllowedResponseHeaders,
-			AddRequestHeaders:      castMap(h.AddRequestHeaders),
-			Metadata:               castMap(h.ResponseMetadata),
+			AddRequestHeaders:      addRequestHeaders,
+			Metadata:               metadata,
 		}
 		spec.IncludeRequestHeaders = h.AllowedRequestHeaders
 		spec.Protocol = &api.TrafficPolicySpec_ExternalAuth_Http{
@@ -992,22 +1023,43 @@ func cast[T ~string](items []T) []string {
 	})
 }
 
-func castMap[T ~string](items map[string]T) map[string]string {
+func castCELSlice(items []shared.CELExpression, invalid func(shared.CELExpression)) []string {
 	if items == nil {
 		return nil
 	}
-	res := make(map[string]string, len(items))
-	for k, v := range items {
-		res[k] = string(v)
+	res := make([]string, 0, len(items))
+	for _, item := range items {
+		res = append(res, string(item))
+		if !isCEL(item) {
+			invalid(item)
+		}
 	}
 	return res
 }
 
-func castPtr[T ~string](item *T) *string {
+func castCELMap(items map[string]shared.CELExpression, invalid func(string, shared.CELExpression)) map[string]string {
+	if items == nil {
+		return nil
+	}
+	res := make(map[string]string, len(items))
+	for k, v := range maps.SeqStable(items) {
+		res[k] = string(v)
+		if !isCEL(v) {
+			invalid(k, v)
+		}
+	}
+	return res
+}
+
+func castCELPtr(item *shared.CELExpression, invalid func(shared.CELExpression)) *string {
 	if item == nil {
 		return nil
 	}
-	return ptr.Of(string(*item))
+	res := ptr.Of(string(*item))
+	if !isCEL(*item) {
+		invalid(*item)
+	}
+	return res
 }
 
 // processAuthorizationPolicy processes Authorization configuration and creates corresponding Agw policies
@@ -1015,12 +1067,18 @@ func processAuthorizationPolicy(
 	auth *shared.Authorization,
 	basePolicyName string,
 	policy types.NamespacedName,
-) *api.Policy {
-	var allowPolicies, denyPolicies []string
+) (*api.Policy, error) {
+	var errs []error
+	var allowPolicies, denyPolicies, requirePolicies []string
+	policies := castCELSlice(auth.Policy.MatchExpressions, func(expr shared.CELExpression) {
+		errs = append(errs, fmt.Errorf("authorization matchExpression is not a valid CEL expression: %s", expr))
+	})
 	if auth.Action == shared.AuthorizationPolicyActionDeny {
-		denyPolicies = append(denyPolicies, cast(auth.Policy.MatchExpressions)...)
+		denyPolicies = append(denyPolicies, policies...)
+	} else if auth.Action == shared.AuthorizationPolicyActionRequire {
+		requirePolicies = append(requirePolicies, policies...)
 	} else {
-		allowPolicies = append(allowPolicies, cast(auth.Policy.MatchExpressions)...)
+		allowPolicies = append(allowPolicies, policies...)
 	}
 
 	pol := &api.Policy{
@@ -1030,8 +1088,9 @@ func processAuthorizationPolicy(
 			Traffic: &api.TrafficPolicySpec{
 				Kind: &api.TrafficPolicySpec_Authorization{
 					Authorization: &api.TrafficPolicySpec_RBAC{
-						Allow: allowPolicies,
-						Deny:  denyPolicies,
+						Allow:   allowPolicies,
+						Deny:    denyPolicies,
+						Require: requirePolicies,
 					},
 				},
 			},
@@ -1042,7 +1101,7 @@ func processAuthorizationPolicy(
 		"policy", basePolicyName,
 		"agentgateway_policy", pol.Name)
 
-	return pol
+	return pol, errors.Join(errs...)
 }
 
 func getFrontendPolicyName(trafficPolicyNs, trafficPolicyName string) string {
@@ -1132,15 +1191,19 @@ func processGlobalRateLimitPolicy(
 	basePolicyName string,
 	policy types.NamespacedName,
 ) (*api.Policy, error) {
-	var backendErr error
+	var errs []error
 	be, err := buildBackendRef(ctx, grl.BackendRef, policy.Namespace)
 	if err != nil {
-		backendErr = fmt.Errorf("failed to build global rate limit: %v", err)
+		errs = append(errs, fmt.Errorf("failed to build global rate limit: %v", err))
 	}
 	// Translate descriptors
 	descriptors := make([]*api.TrafficPolicySpec_RemoteRateLimit_Descriptor, 0, len(grl.Descriptors))
 	for _, d := range grl.Descriptors {
-		if agw := processRateLimitDescriptor(d); agw != nil {
+		agw, err := processRateLimitDescriptor(d)
+		if err != nil {
+			errs = append(errs, err)
+		}
+		if agw != nil {
 			descriptors = append(descriptors, agw)
 		}
 	}
@@ -1156,19 +1219,24 @@ func processGlobalRateLimitPolicy(
 						Domain:      grl.Domain,
 						Target:      be,
 						Descriptors: descriptors,
+						FailureMode: remoteRateLimitFailureMode(grl.FailureMode),
 					},
 				},
 			},
 		},
 	}
 
-	return p, backendErr
+	return p, errors.Join(errs...)
 }
 
-func processRateLimitDescriptor(descriptor agentgateway.RateLimitDescriptor) *api.TrafficPolicySpec_RemoteRateLimit_Descriptor {
+func processRateLimitDescriptor(descriptor agentgateway.RateLimitDescriptor) (*api.TrafficPolicySpec_RemoteRateLimit_Descriptor, error) {
 	entries := make([]*api.TrafficPolicySpec_RemoteRateLimit_Entry, 0, len(descriptor.Entries))
+	var errs []error
 
 	for _, entry := range descriptor.Entries {
+		if !isCEL(entry.Expression) {
+			errs = append(errs, fmt.Errorf("rate limit descriptor entry %q is not a valid CEL expression: %s", entry.Name, entry.Expression))
+		}
 		entries = append(entries, &api.TrafficPolicySpec_RemoteRateLimit_Entry{
 			Key:   entry.Name,
 			Value: string(entry.Expression),
@@ -1183,7 +1251,21 @@ func processRateLimitDescriptor(descriptor agentgateway.RateLimitDescriptor) *ap
 	return &api.TrafficPolicySpec_RemoteRateLimit_Descriptor{
 		Entries: entries,
 		Type:    rlType,
+	}, errors.Join(errs...)
+}
+
+func extAuthFailureMode(mode agentgateway.FailureMode) api.TrafficPolicySpec_ExternalAuth_FailureMode {
+	if mode == agentgateway.FailOpen {
+		return api.TrafficPolicySpec_ExternalAuth_ALLOW
 	}
+	return api.TrafficPolicySpec_ExternalAuth_DENY
+}
+
+func remoteRateLimitFailureMode(mode agentgateway.FailureMode) api.TrafficPolicySpec_RemoteRateLimit_FailureMode {
+	if mode == agentgateway.FailOpen {
+		return api.TrafficPolicySpec_RemoteRateLimit_FAIL_OPEN
+	}
+	return api.TrafficPolicySpec_RemoteRateLimit_FAIL_CLOSED
 }
 
 func buildBackendRef(ctx PolicyCtx, ref gwv1.BackendObjectReference, defaultNS string) (*api.BackendReference, error) {
