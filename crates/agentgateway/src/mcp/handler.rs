@@ -22,10 +22,9 @@ use itertools::Itertools;
 use rmcp::ErrorData;
 use rmcp::model::{
 	ClientNotification, ClientRequest, Implementation, JsonRpcNotification, JsonRpcRequest,
-	CallToolResult, Content, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
-	ListToolsResult, Prompt, PromptsCapability, ProtocolVersion, RawContent, RequestId,
-	ResourcesCapability, ServerCapabilities, ServerInfo, ServerJsonRpcMessage, ServerResult, Tool,
-	ToolsCapability,
+	ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
+	ProtocolVersion, RawContent, RequestId, ServerCapabilities, ServerInfo, ServerJsonRpcMessage,
+	ServerResult,
 };
 use tracing::{debug, warn};
 

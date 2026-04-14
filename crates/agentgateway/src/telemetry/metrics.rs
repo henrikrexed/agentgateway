@@ -386,7 +386,6 @@ impl Metrics {
 				);
 				m
 			},
-<<<<<<< HEAD
 			mcp_response_compression_original_bytes: {
 				let m = Family::<CompressionLabels, _>::new_with_constructor(move || {
 					PromHistogram::new(COMPRESSION_BYTES_BUCKET)
